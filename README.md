@@ -7,6 +7,9 @@ We implement Geo‑kWTA, a constant‑parameter geometric family of
 global top‑k masks, and the shuffle counterfactual protocol used in
 the experiments.
 
+In the geo_r mode with the default experimental budget used in the paper, 
+a single main sweep takes approximately 9–10 minutes on an RTX 4060 Laptop GPU.
+
 ## 1. Environment Setup
 
 Install the necessary dependencies using `pip`:
@@ -37,7 +40,12 @@ Modify the `EXP_MODE` constant at the bottom of the script (line 1489) to select
 - `"random"`: Unstructured random masking baseline.
 - `"bestof_random"`：Unstructured random masking with N=176 budget.
 - `"kwta"`: Standard k-WTA baseline.
-- `"semantic_test"`: Runs the semantic significance analysis (Artificial vs. Biological neurons).
+- `"semantic_test"`: Runs the synthetic semantic tests described in Appendix A.1 .
+
+- To reproduce the main CIFAR‑10 ResNet‑50 results (Fig. 2 in the paper),
+first run `sphere_kwta_dimension_resnet50_MAE.py` with `EXPMODE="geo_r"`,
+`"random"`, `"kwta"`, and `"bestofrandom"` on `DATASET="cifar10r50layer4"`,
+then call `cifar10_results_r50/plot_4modes_ci95.py`.
 
 ### Hyperparameter Tuning:
 Key hyperparameters mentioned in the paper can be adjusted in `sphere_kwta_dimension_resnet50_MAE.py`:
@@ -64,11 +72,6 @@ Plotting scripts are organized by experiment type. Run them to generate the figu
 - `stage4_b1-b2/bar_kfrac_blocks.py`: Generates block-wise sparsity analysis plots.
 - `shuffle_comparison_cifar10/plot_geo_vs_shuffle_ci95_kmax04.py`: Generates plots comparing geometric selection with random shuffling.
 
-## 5. Directory Structure
-
-- `2X2_test/`: Interpretability tests on 2D/3D latent spaces.
-- `cifar10*_results/`: Stored experiment results and specific plotting tools.
-- `shuffle.py`: Utility functions for permutation-based significance tests.
 
 ## License
 
