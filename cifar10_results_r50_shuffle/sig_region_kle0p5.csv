@@ -1,2 +1,0 @@
-region,kmax,n_seeds,n_common_points_total,mean_delta_nonshuffle_minus_shuffle,ci95_lo,ci95_hi,paired_ttest_p,wilcoxon_p
-mean over common k_fracs with k_frac <= 0.5,0.5,10,100,0.028190999627113345,0.025476818079056628,0.030905181175170063,1.0918374105422056e-09,0.0009765625
