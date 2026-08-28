@@ -1,0 +1,102 @@
+meta:
+  seed: 3
+  gate_mode: geo
+  geo_gate_type: sphere_center_radius
+  pts_dim: 3
+  sigma0: 0.2
+  maxiter: 20
+  hidden_dim: 512
+  ridge_alpha: 1.0
+  data_dir: d:\my projects\PythonProject4\data
+  val_ratio: 0.1
+runs:
+- k_frac: 0.05
+  initial_acc: 0.28119999170303345
+  best_acc: 0.3271999955177307
+  best_loss: 672.8087399974465
+  best_radius: 1.7722248854474725
+  best_center:
+  - 0.3637555639821032
+  - 0.27751088418878994
+  - 0.3461012881256451
+  test_acc: 0.31790000200271606
+  test_loss: 0.008791899308562279
+  active_ratio: 0.0498046875
+  active_neurons: 102
+  total_neurons: 2048
+  elapsed_sec: 0.5967903137207031
+- k_frac: 0.1
+  initial_acc: 0.4189999997615814
+  best_acc: 0.4307999908924103
+  best_loss: 569.208385403268
+  best_radius: 0.8985848526997853
+  best_center:
+  - 1.3420621799590897
+  - 0.13902612682221344
+  - 0.4563201426158244
+  test_acc: 0.4226999878883362
+  test_loss: 0.008383718319237232
+  active_ratio: 0.099609375
+  active_neurons: 204
+  total_neurons: 2048
+  elapsed_sec: 0.825577974319458
+- k_frac: 0.2
+  initial_acc: 0.5442000031471252
+  best_acc: 0.5559999942779541
+  best_loss: 444.00741290301085
+  best_radius: 0.7256136510412657
+  best_center:
+  - 0.32340864859502494
+  - -0.14481765307918024
+  - 0.30574528424741415
+  test_acc: 0.5432999730110168
+  test_loss: 0.007433092221617699
+  active_ratio: 0.19970703125
+  active_neurons: 409
+  total_neurons: 2048
+  elapsed_sec: 1.2603390216827393
+- k_frac: 0.3
+  initial_acc: 0.593999981880188
+  best_acc: 0.6065999865531921
+  best_loss: 393.4070195653476
+  best_radius: 1.128120281903678
+  best_center:
+  - 0.027688268584935075
+  - -1.0268730537048842
+  - -0.22128901330350423
+  test_acc: 0.5916999578475952
+  test_loss: 0.007015942595899105
+  active_ratio: 0.2998046875
+  active_neurons: 614
+  total_neurons: 2048
+  elapsed_sec: 1.854372262954712
+- k_frac: 0.4
+  initial_acc: 0.6255999803543091
+  best_acc: 0.6403999924659729
+  best_loss: 359.606676642783
+  best_radius: 0.9600461452990282
+  best_center:
+  - 0.13189040510572708
+  - -0.9439402331807046
+  - 0.0287962345465642
+  test_acc: 0.6297000050544739
+  test_loss: 0.006674796808511019
+  active_ratio: 0.39990234375
+  active_neurons: 819
+  total_neurons: 2048
+  elapsed_sec: 2.5446505546569824
+- k_frac: 0.5
+  initial_acc: 0.6434000134468079
+  best_acc: 0.6595999598503113
+  best_loss: 340.4065678138286
+  best_radius: 0.7629916247335884
+  best_center:
+  - 0.4050259152495551
+  - -0.3120246540722238
+  - -0.20617256480367568
+  test_acc: 0.6486999988555908
+  test_loss: 0.006547700613737106
+  active_ratio: 0.5
+  active_neurons: 1024
+  total_neurons: 2048
+  elapsed_sec: 3.003507137298584
