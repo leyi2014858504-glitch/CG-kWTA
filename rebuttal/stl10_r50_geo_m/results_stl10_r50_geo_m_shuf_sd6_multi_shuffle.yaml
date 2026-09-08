@@ -1,0 +1,14 @@
+meta:
+  n_shuffle_runs: 5
+  seeds:
+  - 6
+  - 7
+  - 8
+  - 9
+  - 10
+runs_by_repeat:
+- results_stl10_r50_geo_m_shuf_sd6_rep0.yaml
+- results_stl10_r50_geo_m_shuf_sd6_rep1.yaml
+- results_stl10_r50_geo_m_shuf_sd6_rep2.yaml
+- results_stl10_r50_geo_m_shuf_sd6_rep3.yaml
+- results_stl10_r50_geo_m_shuf_sd6_rep4.yaml

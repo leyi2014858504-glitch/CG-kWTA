@@ -1,0 +1,14 @@
+meta:
+  n_shuffle_runs: 5
+  seeds:
+  - 1
+  - 2
+  - 3
+  - 4
+  - 5
+runs_by_repeat:
+- results_stl10_vit_geo_r_shuf_sigma0.50_sd1_rep0.yaml
+- results_stl10_vit_geo_r_shuf_sigma0.50_sd1_rep1.yaml
+- results_stl10_vit_geo_r_shuf_sigma0.50_sd1_rep2.yaml
+- results_stl10_vit_geo_r_shuf_sigma0.50_sd1_rep3.yaml
+- results_stl10_vit_geo_r_shuf_sigma0.50_sd1_rep4.yaml
