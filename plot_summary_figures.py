@@ -9,10 +9,9 @@ Outputs to d:\\cg-kwta\\Figures\\summary\\:
   5. cma_convergence.png         mean CMA-ES fbest trajectory, orig vs shuffled
 """
 import os
+import csv
 import glob
 import re
-import sys
-import traceback
 import yaml
 import numpy as np
 import matplotlib
@@ -20,14 +19,11 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 from scipy import stats
 
-_LOG = open(r"d:\cg-kwta\_plot_log.txt", "w", encoding="utf-8")
-def log(*a):
-    _LOG.write(" ".join(str(x) for x in a) + "\n"); _LOG.flush()
-
 BASE = r"d:\my projects\PythonProject4"
 REB = os.path.join(BASE, "rebuttal")
 REBDIM = os.path.join(BASE, "rebuttal_dim")
 GMORIG = os.path.join(BASE, "rebuttal_geo_m_orig")
+REPORTS = r"d:\cg-kwta\Reports"
 OUT = r"d:\cg-kwta\Figures\summary"
 os.makedirs(OUT, exist_ok=True)
 
@@ -99,41 +95,47 @@ def per_seed_lowk_gap(orig, null, hi=0.30):
     return np.array(gaps)
 
 
-def holm(pv):
-    n = len(pv); order = np.argsort(pv); adj = np.ones(n)
-    for rank, i in enumerate(order):
-        adj[i] = min(1.0, pv[i] * (n - rank))
-    for i in range(1, n):
-        a, b = order[i-1], order[i]
-        if adj[b] < adj[a]:
-            adj[b] = adj[a]
-    return adj
+def load_csv_sig():
+    """Single source of truth for significance.
+
+    Reads Reports/multishuffle_sig.csv (produced by make_rebuttal_report.py).
+    Holm there is applied over ALL 20 k_fracs within a configuration; we then
+    count how many low-k (<=0.30) points remain significant. The plot script
+    must NOT re-run tests/corrections (a 6-point correction would be a
+    different, more liberal family).
+    Returns {(dataset, model, coord_mode): (sig_lowk, n_lowk)}.
+    """
+    counts = {}
+    with open(os.path.join(REPORTS, "multishuffle_sig.csv"), encoding="utf-8") as f:
+        for r in csv.DictReader(f):
+            if r.get("null_kind") != "multi_perm":
+                continue
+            try:
+                k = float(r["k_frac"])
+            except ValueError:
+                continue
+            if k > 0.30:
+                continue
+            key = (r["dataset"], r["model"], r["coord_mode"])
+            sig, n = counts.get(key, (0, 0))
+            counts[key] = (sig + (r["sig_holm"] == "True"), n + 1)
+    return counts
 
 
 # ---------------- 1. shuffle gap by combo ----------------
+CSV_SIG = load_csv_sig()
 combos = []
-log("== section 1: shuffle_gap_by_combo ==")
 for ds in DATASETS:
     for m in MODELS:
         for gm in ["geo_r", "geo_m"]:
             orig = get_orig(ds, m, gm)
             null = load_null(os.path.join(REB, f"{ds}_{m}_{gm}"))
             gaps = per_seed_lowk_gap(orig, null)
-            # Holm significance across k_fracs
-            seeds = sorted(set(orig) & set(null))
-            ks = sorted({k for sd in seeds for k in orig[sd] if k in null[sd] and k <= 0.30})
-            pv = []
-            for k in ks:
-                d = np.array([orig[sd][k] - null[sd][k] for sd in seeds if k in orig[sd] and k in null[sd]])
-                if len(d) >= 2:
-                    # two-sided Wilcoxon primary analysis (no one-sided halving)
-                    p2 = stats.wilcoxon(d).pvalue if len(d) >= 10 else stats.ttest_1samp(d, 0.0).pvalue
-                    pv.append(p2 if np.isfinite(p2) else 1.0)
-            sig = int((holm(np.array(pv)) < 0.05).sum()) if pv else 0
+            sig, n_lowk = CSV_SIG.get((ds, m, gm), (0, 6))
             combos.append({"ds": ds, "m": m, "gm": gm, "gaps": gaps,
                            "mean": gaps.mean() if len(gaps) else 0.0,
                            "sem": gaps.std(ddof=1) / np.sqrt(len(gaps)) if len(gaps) > 1 else 0.0,
-                           "sig_lowk": sig, "n_lowk": len(ks)})
+                           "sig_lowk": sig, "n_lowk": n_lowk})
 
 labels = [f"{c['ds'][:5]}_{c['m']}" for c in combos]
 xs = np.arange(len(combos))
@@ -153,7 +155,9 @@ ax.axhline(0, color="k", linewidth=0.8)
 ax.set_xticks(xs + w / 2)
 ax.set_xticklabels(labels, fontsize=9)
 ax.set_ylabel("low-k shuffle gap (orig - mean of 5 perms)")
-ax.set_title("Shuffle gap by combo (Holm-corrected low-k: * all sig, + some, ns none)")
+ax.set_title("Shuffle gap by combo\n(* all low-k Holm-significant, + some, ns none;\n"
+             "Holm over all 20 k within config per multishuffle_sig.csv;\n"
+             "stars = low-k point coverage, not a test of the bar mean)")
 ax.legend()
 ax.grid(True, alpha=0.3, axis="y")
 plt.tight_layout()
@@ -266,7 +270,6 @@ p4 = os.path.join(OUT, "geo_vs_baselines.png")
 plt.savefig(p4, dpi=200); plt.close(); print("saved:", p4)
 
 # ---------------- 5. CMA-ES convergence (full dim_sweep, per condition panels) ----------------
-log("== section 5: cma_convergence ==")
 GM_COL = {"geo_r": C_GEOR, "geo_pca": "#2ca02c"}
 fig, axes = plt.subplots(1, 2, figsize=(12, 4.8), sharey=True)
 improvement_stats = {}   # (gm, cond) -> (mean, median, n)
