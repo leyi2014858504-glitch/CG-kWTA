@@ -249,13 +249,20 @@ def analyze_multi_shuffle(folder):
         else:
             stat, p_two = stats.ttest_1samp(deltas, 0.0)
         p_one = float(p_two / 2.0) if np.mean(deltas) > 0 else float(1.0 - p_two / 2.0)
+        # paired-delta 95% CI (pairing unit = seed)
+        n = int(len(deltas))
+        se = float(np.std(deltas, ddof=1) / np.sqrt(n)) if n > 1 else 0.0
+        tcrit = float(stats.t.ppf(0.975, n - 1)) if n > 1 else 0.0
+        mean_d = float(np.mean(deltas))
         results.append({
             "k_frac": k,
             "orig_mean": float(np.mean([orig[sd][k] for sd in seeds if k in orig[sd]])),
             "shuf_mean": float(np.mean([null[sd][k] for sd in seeds if k in null[sd]])),
-            "mean_delta": float(np.mean(deltas)),
+            "mean_delta": mean_d,
+            "ci_lo": mean_d - tcrit * se,
+            "ci_hi": mean_d + tcrit * se,
             "raw_p": p_one,
-            "n_seeds": int(len(deltas)),
+            "n_seeds": n,
             "n_shuffle": int(idx.get("meta", {}).get("n_shuffle_runs", len(idx.get("runs_by_repeat", [])))),
         })
 
@@ -271,6 +278,30 @@ def analyze_multi_shuffle(folder):
         r["bh_fdr_p"] = float(bh_adj[i])
         r["significant_holm"] = holm_adj[i] < 0.05
         r["significant_bh"] = bh_adj[i] < 0.05
+
+    # low-k mean gap (mean of per-k paired deltas over k <= 0.30)
+    lowk = [r["mean_delta"] for r in results if r["k_frac"] <= 0.30]
+    lowk_n = len(lowk)
+    lowk_mean = float(np.mean(lowk)) if lowk else float("nan")
+    lowk_sem = float(np.std(lowk, ddof=1) / np.sqrt(lowk_n)) if lowk_n > 1 else 0.0
+    tcrit = float(stats.t.ppf(0.975, lowk_n - 1)) if lowk_n > 1 else 0.0
+    lowk_ci_lo = lowk_mean - tcrit * lowk_sem
+    lowk_ci_hi = lowk_mean + tcrit * lowk_sem
+    results.append({
+        "k_frac": "lowk<=0.30 mean",
+        "orig_mean": float("nan"),
+        "shuf_mean": float("nan"),
+        "mean_delta": lowk_mean,
+        "ci_lo": lowk_ci_lo,
+        "ci_hi": lowk_ci_hi,
+        "raw_p": float("nan"),
+        "n_seeds": int(len(seeds)),
+        "n_shuffle": results[0]["n_shuffle"],
+        "holm_p": float("nan"),
+        "bh_fdr_p": float("nan"),
+        "significant_holm": False,
+        "significant_bh": False,
+    })
     return results
 
 
@@ -279,15 +310,20 @@ def print_results(results, title="Statistical Analysis"):
         return
     print(f"\n{'='*80}")
     print(f"  {title}")
-    print(f"{'='*80}")
-    print(f"{'k_frac':>8} {'orig':>8} {'shuf':>8} {'delta':>8} {'raw_p':>10} {'holm_p':>10} {'bh_fdr':>10} {'sig(H)':>8} {'sig(B)':>8}")
-    print("-" * 90)
+    print(f"{'='*96}")
+    print(f"{'k_frac':>14} {'orig':>8} {'shuf':>8} {'delta':>8} {'CI_lo':>8} {'CI_hi':>8} {'raw_p':>9} {'holm_p':>9} {'sig(H)':>7}")
+    print("-" * 96)
     for r in results:
+        kf = r["k_frac"]
+        if isinstance(kf, str):
+            print(f"{kf:>14} {'':>8} {'':>8} {r['mean_delta']:+8.4f} {r.get('ci_lo', float('nan')):8.4f} "
+                  f"{r.get('ci_hi', float('nan')):8.4f} {'':>9} {'':>9} {'':>7}")
+            continue
         sig_h = "YES" if r["significant_holm"] else "no"
-        sig_b = "YES" if r["significant_bh"] else "no"
-        print(f"{r['k_frac']:8.2f} {r['orig_mean']:8.4f} {r['shuf_mean']:8.4f} {r['mean_delta']:+8.4f} "
-              f"{r['raw_p']:10.6f} {r['holm_p']:10.6f} {r['bh_fdr_p']:10.6f} {sig_h:>8} {sig_b:>8}")
-    print(f"{'='*80}")
+        print(f"{kf:8.2f}   {r['orig_mean']:8.4f} {r['shuf_mean']:8.4f} {r['mean_delta']:+8.4f} "
+              f"{r.get('ci_lo', float('nan')):8.4f} {r.get('ci_hi', float('nan')):8.4f} "
+              f"{r['raw_p']:9.5f} {r['holm_p']:9.5f} {sig_h:>7}")
+    print(f"{'='*96}")
 
 
 def main():

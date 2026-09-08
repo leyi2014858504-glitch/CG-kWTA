@@ -11,12 +11,18 @@ Outputs to d:\\cg-kwta\\Figures\\summary\\:
 import os
 import glob
 import re
+import sys
+import traceback
 import yaml
 import numpy as np
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 from scipy import stats
+
+_LOG = open(r"d:\cg-kwta\_plot_log.txt", "w", encoding="utf-8")
+def log(*a):
+    _LOG.write(" ".join(str(x) for x in a) + "\n"); _LOG.flush()
 
 BASE = r"d:\my projects\PythonProject4"
 REB = os.path.join(BASE, "rebuttal")
@@ -106,6 +112,7 @@ def holm(pv):
 
 # ---------------- 1. shuffle gap by combo ----------------
 combos = []
+log("== section 1: shuffle_gap_by_combo ==")
 for ds in DATASETS:
     for m in MODELS:
         for gm in ["geo_r", "geo_m"]:
@@ -152,25 +159,36 @@ plt.tight_layout()
 p1 = os.path.join(OUT, "shuffle_gap_by_combo.png")
 plt.savefig(p1, dpi=200); plt.close(); print("saved:", p1)
 
-# ---------------- 2. d sensitivity ----------------
-fig, ax = plt.subplots(figsize=(8, 5))
-for ds, m, col, ls in [("cifar10", "r50", C_GEOR, "-"), ("cifar10", "vit", C_GEOR, "--"),
-                       ("stl10", "r50", C_GEOM, "-"), ("stl10", "vit", C_GEOM, "--")]:
-    vals = []
-    for d in [1, 2, 3, 5, 8]:
-        folder = os.path.join(REBDIM, f"{ds}_{m}_d{d}")
-        tag = f"{ds}_{TAG[m]}"
-        orig = load_seed_map(folder, f"results_{tag}_geo_r_sigma0.50_sd[0-9].yaml")
-        shuf = load_seed_map(folder, f"results_{tag}_geo_r_shuf_sigma0.50_sd[0-9].yaml")
-        g = per_seed_lowk_gap(orig, shuf)
-        vals.append(g.mean() if len(g) else np.nan)
-    ax.plot([1, 2, 3, 5, 8], vals, marker="o", color=col, linestyle=ls, label=f"{ds} {m}")
-ax.axhline(0, color="k", linewidth=0.8)
-ax.set_xlabel("coordinate dimension d")
-ax.set_ylabel("low-k shuffle gap")
-ax.set_title("d-sensitivity (geo_r, same-run orig - shuffled)")
-ax.grid(True, alpha=0.3)
-ax.legend()
+# ---------------- 2. d sensitivity (2x2: coord x model, 3 datasets per panel) ----------------
+DIMS = os.path.join(BASE, "dim_sweep")
+COORD_TMPL = {"geo_r": "results_{tag}_geo_r{sfx}_sigma0.50_sd*.yaml",
+              "geo_pca": "results_{tag}_geo_pca{sfx}_sd*.yaml"}
+DS_COL = {"cifar10": "#1f77b4", "cifar100": "#ff7f0e", "stl10": "#2ca02c"}
+fig, axes = plt.subplots(2, 2, figsize=(10.5, 7.6))
+for row, gm in enumerate(["geo_r", "geo_pca"]):
+    for col, m in enumerate(["r50", "vit"]):
+        ax = axes[row, col]
+        for ds in ["cifar10", "cifar100", "stl10"]:
+            tag = f"{ds}_{TAG[m]}"
+            vals = []
+            for d in [1, 2, 3, 5, 8]:
+                folder = os.path.join(DIMS, gm, f"{ds}_{m}_d{d}")
+                if not os.path.isdir(folder):
+                    vals.append(np.nan)
+                    continue
+                orig = load_seed_map(folder, COORD_TMPL[gm].format(tag=tag, sfx=""))
+                shuf = load_seed_map(folder, COORD_TMPL[gm].format(tag=tag, sfx="_shuf"))
+                g = per_seed_lowk_gap(orig, shuf)
+                vals.append(g.mean() if len(g) else np.nan)
+            ax.plot([1, 2, 3, 5, 8], vals, marker="o", color=DS_COL[ds], label=ds, linewidth=1.8)
+        ax.axhline(0, color="k", linewidth=0.8)
+        ax.set_xlabel("coordinate dimension d")
+        ax.set_title(f"{'RandProj' if gm == 'geo_r' else 'PCA'} — {m}")
+        ax.grid(True, alpha=0.3)
+        ax.legend(fontsize=8)
+axes[1, 0].set_ylabel("low-k shuffle gap")
+axes[0, 0].set_ylabel("low-k shuffle gap")
+fig.suptitle("d-sensitivity: low-k shuffle gap vs dimension (same-run orig - shuffled)", y=0.99)
 plt.tight_layout()
 p2 = os.path.join(OUT, "d_sensitivity.png")
 plt.savefig(p2, dpi=200); plt.close(); print("saved:", p2)
@@ -246,13 +264,20 @@ plt.tight_layout()
 p4 = os.path.join(OUT, "geo_vs_baselines.png")
 plt.savefig(p4, dpi=200); plt.close(); print("saved:", p4)
 
-# ---------------- 5. CMA-ES convergence (d3 runs) ----------------
-fig, ax = plt.subplots(figsize=(8, 5))
-for cond, col, ls in [("orig", C_GEOR, "-"), ("shuffled", C_GEOM, "-")]:
-    pat = "results_*_geo_r_sigma0.50_sd[0-9].yaml" if cond == "orig" else "results_*_geo_r_shuf_sigma0.50_sd[0-9].yaml"
-    hist = []
-    for folder in glob.glob(os.path.join(REBDIM, "*")):
-        for f in glob.glob(os.path.join(folder, pat)):
+# ---------------- 5. CMA-ES convergence (full dim_sweep, per condition panels) ----------------
+log("== section 5: cma_convergence ==")
+GM_COL = {"geo_r": C_GEOR, "geo_pca": "#2ca02c"}
+fig, axes = plt.subplots(1, 2, figsize=(12, 4.8), sharey=True)
+improvement_stats = {}   # (gm, cond) -> (mean, median, n)
+for panel, cond, sfx in [(0, "orig", ""), (1, "shuffled", "_shuf")]:
+    ax = axes[panel]
+    for gm in ["geo_r", "geo_pca"]:
+        hist = []
+        glob_pat = (f"results_*_geo_r{sfx}_sigma0.50_sd*.yaml" if gm == "geo_r"
+                    else f"results_*_geo_pca{sfx}_sd*.yaml")
+        for f in glob.glob(os.path.join(DIMS, gm, "**", glob_pat), recursive=True):
+            if "_multi_shuffle" in f:
+                continue
             try:
                 with open(f, encoding="utf-8") as fh:
                     d = yaml.safe_load(fh)
@@ -262,24 +287,51 @@ for cond, col, ls in [("orig", C_GEOR, "-"), ("shuffled", C_GEOM, "-")]:
                 h = r.get("cma_fbest_history")
                 if h and len(h) >= 5:
                     hist.append(np.array(h, dtype=float))
-    if not hist:
-        continue
-    L = min(len(h) for h in hist)
-    arr = np.vstack([h[:L] for h in hist])
-    base = arr[:, 0:1]
-    norm = arr / np.maximum(base, 1e-9)  # relative to first iter = 1
-    mu = norm.mean(axis=0)
-    sem = norm.std(axis=0, ddof=1) / np.sqrt(len(norm))
-    crit = stats.t.ppf(0.975, len(norm) - 1)
-    ax.plot(range(L), mu, ls, color=col, label=f"{cond} (n={len(hist)})", linewidth=2)
-    ax.fill_between(range(L), mu - crit * sem, mu + crit * sem, color=col, alpha=0.12)
-ax.set_xlabel("CMA-ES iteration")
-ax.set_ylabel("fbest / fbest(iter 0)")
-ax.set_title("CMA-ES convergence (d3 runs, mean ± 95% CI)")
-ax.grid(True, alpha=0.3)
-ax.legend()
+        if not hist:
+            continue
+        L = min(len(h) for h in hist)
+        arr = np.vstack([h[:L] for h in hist])
+        norm = arr / np.maximum(arr[:, 0:1], 1e-9)
+        mu = norm.mean(axis=0)
+        sem = norm.std(axis=0, ddof=1) / np.sqrt(len(norm))
+        crit = stats.t.ppf(0.975, len(norm) - 1)
+        ax.plot(range(L), mu, color=GM_COL[gm], label=f"{gm} (n={len(hist)})", linewidth=2)
+        ax.fill_between(range(L), mu - crit * sem, mu + crit * sem, color=GM_COL[gm], alpha=0.12)
+        rel = (arr[:, 0] - arr[:, -1]) / np.maximum(np.abs(arr[:, 0]), 1e-9)
+        improvement_stats[(gm, cond)] = (float(rel.mean()), float(np.median(rel)), len(hist))
+    ax.axhline(1.0, color="k", linewidth=0.6, linestyle=":")
+    ax.set_xlabel("CMA-ES iteration")
+    ax.set_title(cond)
+    ax.grid(True, alpha=0.3)
+    ax.legend(fontsize=8)
+axes[0].set_ylabel("best-so-far fbest / fbest(iter 0)")
+fig.suptitle("CMA-ES best-so-far trajectories (dim_sweep, mean +/- 95% CI)", y=0.99)
 plt.tight_layout()
 p5 = os.path.join(OUT, "cma_convergence.png")
 plt.savefig(p5, dpi=200); plt.close(); print("saved:", p5)
+
+# ---------------- 6. optimization headroom: orig vs shuffled improvement ----------------
+keys = ["geo_r", "geo_pca"]
+x = np.arange(len(keys))
+w = 0.35
+fig, ax = plt.subplots(figsize=(6.5, 4.2))
+mean_m = [improvement_stats.get((g, "orig"), (np.nan,) * 3)[0] * 100 for g in keys]
+mean_s = [improvement_stats.get((g, "shuffled"), (np.nan,) * 3)[0] * 100 for g in keys]
+med_m = [improvement_stats.get((g, "orig"), (np.nan,) * 3)[1] * 100 for g in keys]
+med_s = [improvement_stats.get((g, "shuffled"), (np.nan,) * 3)[1] * 100 for g in keys]
+ax.bar(x - w / 2 - 0.04, mean_m, width=w * 0.9, color=GM_COL["geo_r"], alpha=0.9, label="original coords")
+ax.bar(x + w / 2 + 0.04, mean_s, width=w * 0.9, color="#c3c9f2", label="shuffled coords")
+for i, g in enumerate(keys):
+    n_o = improvement_stats.get((g, "orig"), (0, 0, 0))[2]
+    print(f"improvement {g}: orig mean={mean_m[i]:.1f}% (n={n_o})  shuf mean={mean_s[i]:.1f}%")
+ax.set_xticks(x)
+ax.set_xticklabels(["RandProj", "PCA"])
+ax.set_ylabel("relative improvement over 20 iters (%)")
+ax.set_title("Search headroom: best-so-far improvement,\noriginal vs shuffled coordinates")
+ax.grid(True, alpha=0.3, axis="y")
+ax.legend(fontsize=9)
+plt.tight_layout()
+p6 = os.path.join(OUT, "search_headroom.png")
+plt.savefig(p6, dpi=200); plt.close(); print("saved:", p6)
 
 print("all summary figures done.")
