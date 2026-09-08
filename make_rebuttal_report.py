@@ -13,7 +13,11 @@ Produces (in d:\\cg-kwta\\Reports\\):
 
 Conventions (documented in reports):
   - pairing unit = seed; per-seed delta = orig_acc(seed) - mean_over_5_permutations(seed)
-  - one-sided test H1: gap > 0 (two-sided Wilcoxon p halved when mean delta > 0)
+  - PRIMARY TEST: two-sided. Wilcoxon signed-rank (n>=10) or one-sample t (n<10)
+    on the paired deltas; NO one-sided halving conversion (avoids p distortion
+    under ties/zero differences and post-hoc direction selection).
+  - directionality is conveyed by the sign of the gap, its 95% CI, and effect size
+    (Cohen's dz, Hodges-Lehmann point estimate of the paired location shift).
   - correction: Holm and BH-FDR within each (dataset, model, coord) over k_frac only
   - low-k region: k_frac in [0.05, 0.30]; "lowk_mean_gap" averages per-k mean deltas there
   - best-so-far plateau is NOT evidence of near-optimality without a >20-iteration control
@@ -112,20 +116,27 @@ def paired_gap_rows(orig, null):
         mean_d = float(d.mean())
         se = float(d.std(ddof=1) / np.sqrt(len(d)))
         tcrit = float(stats.t.ppf(0.975, len(d) - 1))
+        # two-sided p-value (primary analysis; no one-sided conversion)
         if len(d) >= 10:
-            p2 = float(stats.wilcoxon(d, alternative="two-sided").pvalue)
+            p_two = float(stats.wilcoxon(d).pvalue)
         else:
-            p2 = float(stats.ttest_1samp(d, 0.0).pvalue)
-        if not np.isfinite(p2):
-            p2 = 1.0
-        p1 = p2 / 2 if mean_d > 0 else 1 - p2 / 2
+            p_two = float(stats.ttest_1samp(d, 0.0).pvalue)
+        if not np.isfinite(p_two):
+            p_two = 1.0
+        # effect sizes: Cohen's dz and Hodges-Lehmann paired location shift
+        sd_d = float(d.std(ddof=1))
+        dz = mean_d / sd_d if sd_d > 0 else float("nan")
+        pairs = (d[:, None] + d[None, :]) / 2.0
+        iu = np.triu_indices(len(d))
+        hl = float(np.median(pairs[iu]))
         rows.append({"k_frac": k, "n_seeds": int(len(d)),
                      "orig_mean": float(np.mean([orig[s][k] for s in seeds if k in orig[s]])),
                      "null_mean": float(np.mean([null[s][k] for s in seeds if k in null[s]])),
                      "gap": mean_d, "ci_lo": mean_d - tcrit * se, "ci_hi": mean_d + tcrit * se,
-                     "raw_p": float(p1)})
+                     "cohens_dz": dz, "hodges_lehmann": hl,
+                     "p_two_sided": float(p_two)})
     if rows:
-        pv = np.array([r["raw_p"] for r in rows])
+        pv = np.array([r["p_two_sided"] for r in rows])
         h = holm(pv); b = bh(pv)
         for i, r in enumerate(rows):
             r["holm_p"] = float(h[i]); r["bh_p"] = float(b[i])
@@ -258,8 +269,8 @@ def report_multishuffle():
               f"sig_holm_lowk={sum(1 for r in low if r['sig_holm'])}/{len(low)}  ({note})")
     cp = os.path.join(REPORTS, "multishuffle_sig.csv")
     cols = ["dataset", "model", "coord_mode", "null_kind", "k_frac", "n_seeds",
-            "orig_mean", "null_mean", "gap", "ci_lo", "ci_hi", "raw_p", "holm_p", "bh_p",
-            "sig_holm", "sig_bh"]
+            "orig_mean", "null_mean", "gap", "ci_lo", "ci_hi", "cohens_dz", "hodges_lehmann",
+            "p_two_sided", "holm_p", "bh_p", "sig_holm", "sig_bh"]
     with open(cp, "w", newline="", encoding="utf-8") as f:
         w = csv.DictWriter(f, fieldnames=cols)
         w.writeheader()

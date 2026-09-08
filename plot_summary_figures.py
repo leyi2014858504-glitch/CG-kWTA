@@ -126,8 +126,9 @@ for ds in DATASETS:
             for k in ks:
                 d = np.array([orig[sd][k] - null[sd][k] for sd in seeds if k in orig[sd] and k in null[sd]])
                 if len(d) >= 2:
-                    p2 = stats.wilcoxon(d, alternative="two-sided").pvalue if len(d) >= 10 else stats.ttest_1samp(d, 0.0).pvalue
-                    pv.append(p2 / 2 if np.mean(d) > 0 else 1 - p2 / 2)
+                    # two-sided Wilcoxon primary analysis (no one-sided halving)
+                    p2 = stats.wilcoxon(d).pvalue if len(d) >= 10 else stats.ttest_1samp(d, 0.0).pvalue
+                    pv.append(p2 if np.isfinite(p2) else 1.0)
             sig = int((holm(np.array(pv)) < 0.05).sum()) if pv else 0
             combos.append({"ds": ds, "m": m, "gm": gm, "gaps": gaps,
                            "mean": gaps.mean() if len(gaps) else 0.0,

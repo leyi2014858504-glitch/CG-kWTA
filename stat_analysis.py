@@ -3,12 +3,14 @@
 Statistical significance analysis with multiple comparison correction.
 
 Reads original (non-shuffled) and multiple shuffle-repeat YAML files,
-computes one-sided paired tests at each k_frac, and applies Holm and
-Benjamini-Hochberg FDR corrections.
+computes TWO-SIDED paired tests at each k_frac (Wilcoxon signed-rank, or
+one-sample t when n < 10), and applies Holm and Benjamini-Hochberg FDR
+corrections. Directionality is conveyed by the sign of the paired gap and
+its 95% CI, not by one-sided p-values.
 
 Usage:
     python stat_analysis.py --original <yaml> --shuffled <yaml> [<yaml> ...]
-    python stat_analysis.py --multi-shuffle <multi_shuffle_yaml>
+    python stat_analysis.py --multi-shuffle <folder>
     python stat_analysis.py --dir <experiment_folder>
 """
 import argparse
@@ -58,11 +60,11 @@ def bh_fdr_correction(pvals):
     return adjusted
 
 
-def paired_test_one_sided(original_acc, shuffle_accs, k_frac):
+def paired_test_two_sided(original_acc, shuffle_accs, k_frac):
     """
-    One-sided paired test: H1: original > shuffled.
-    Uses Wilcoxon signed-rank if N >= 10, otherwise paired t-test.
-    Returns (test_stat, p_value, n_shuffle, mean_delta, std_delta).
+    Two-sided paired test on (original - shuffled) at one k_frac.
+    Uses Wilcoxon signed-rank if N >= 10, otherwise one-sample t-test.
+    Returns (test_stat, p_two_sided, n_shuffle, mean_delta, std_delta).
     """
     orig_vals = np.array([original_acc[k] for k in sorted(original_acc.keys()) if k == k_frac])
     if len(orig_vals) == 0:
@@ -82,12 +84,12 @@ def paired_test_one_sided(original_acc, shuffle_accs, k_frac):
         return (0.0, 1.0, len(deltas), mean_d, std_d)
 
     if len(deltas) >= 10:
-        stat, p_two = stats.wilcoxon(deltas, alternative="two-sided")
+        stat, p_two = stats.wilcoxon(deltas)
     else:
         stat, p_two = stats.ttest_1samp(deltas, 0.0)
-
-    p_one = p_two / 2.0 if mean_d > 0 else 1.0 - p_two / 2.0
-    return (float(stat), float(p_one), len(deltas), mean_d, std_d)
+    if not np.isfinite(p_two):
+        p_two = 1.0
+    return (float(stat), float(p_two), len(deltas), mean_d, std_d)
 
 
 def analyze_folder(folder, original_pattern="*_sd*.yaml", shuffle_pattern="*_shuf_sd*.yaml"):
@@ -146,20 +148,20 @@ def analyze_folder(folder, original_pattern="*_sd*.yaml", shuffle_pattern="*_shu
         shuf_arr = np.array(shuf_means)
         deltas = orig_mean - shuf_arr
 
-        # One-sided test: original > shuffled
+        # two-sided paired test (primary); direction from delta sign + CI
         if len(deltas) >= 10:
-            stat, p_two = stats.wilcoxon(deltas, alternative="two-sided")
+            stat, p_two = stats.wilcoxon(deltas)
         else:
             stat, p_two = stats.ttest_1samp(deltas, 0.0)
-
-        p_one = float(p_two / 2.0) if np.mean(deltas) > 0 else float(1.0 - p_two / 2.0)
+        if not np.isfinite(p_two):
+            p_two = 1.0
 
         results.append({
             "k_frac": k,
             "orig_mean": float(orig_mean),
             "shuf_mean": float(np.mean(shuf_arr)),
             "mean_delta": float(np.mean(deltas)),
-            "raw_p": p_one,
+            "p_two_sided": float(p_two),
             "n_shuffle": len(deltas),
         })
 
@@ -168,7 +170,7 @@ def analyze_folder(folder, original_pattern="*_sd*.yaml", shuffle_pattern="*_shu
         return None
 
     # Apply multiple comparison corrections
-    raw_p = np.array([r["raw_p"] for r in results])
+    raw_p = np.array([r["p_two_sided"] for r in results])
     holm_adj = holm_correction(raw_p)
     bh_adj = bh_fdr_correction(raw_p)
 
@@ -190,7 +192,7 @@ def analyze_multi_shuffle(folder):
     Each index's runs_by_repeat are resolved relative to `folder`.
 
     For each k_frac: delta = orig(seed) - mean(reps(seed)) over seeds;
-    one-sided paired test, then Holm + BH-FDR over k_fracs.
+    two-sided paired test, then Holm + BH-FDR over k_fracs.
     """
     import glob
     orig_files = sorted(glob.glob(os.path.join(folder, "*_sd[0-9].yaml")))
@@ -245,10 +247,11 @@ def analyze_multi_shuffle(folder):
         if len(deltas) < 2:
             continue
         if len(deltas) >= 10:
-            stat, p_two = stats.wilcoxon(deltas, alternative="two-sided")
+            stat, p_two = stats.wilcoxon(deltas)
         else:
             stat, p_two = stats.ttest_1samp(deltas, 0.0)
-        p_one = float(p_two / 2.0) if np.mean(deltas) > 0 else float(1.0 - p_two / 2.0)
+        if not np.isfinite(p_two):
+            p_two = 1.0
         # paired-delta 95% CI (pairing unit = seed)
         n = int(len(deltas))
         se = float(np.std(deltas, ddof=1) / np.sqrt(n)) if n > 1 else 0.0
@@ -261,7 +264,7 @@ def analyze_multi_shuffle(folder):
             "mean_delta": mean_d,
             "ci_lo": mean_d - tcrit * se,
             "ci_hi": mean_d + tcrit * se,
-            "raw_p": p_one,
+            "p_two_sided": float(p_two),
             "n_seeds": n,
             "n_shuffle": int(idx.get("meta", {}).get("n_shuffle_runs", len(idx.get("runs_by_repeat", [])))),
         })
@@ -270,7 +273,7 @@ def analyze_multi_shuffle(folder):
         print("multi-shuffle: no valid k_frac results")
         return None
 
-    raw_p = np.array([r["raw_p"] for r in results])
+    raw_p = np.array([r["p_two_sided"] for r in results])
     holm_adj = holm_correction(raw_p)
     bh_adj = bh_fdr_correction(raw_p)
     for i, r in enumerate(results):
@@ -294,7 +297,7 @@ def analyze_multi_shuffle(folder):
         "mean_delta": lowk_mean,
         "ci_lo": lowk_ci_lo,
         "ci_hi": lowk_ci_hi,
-        "raw_p": float("nan"),
+        "p_two_sided": float("nan"),
         "n_seeds": int(len(seeds)),
         "n_shuffle": results[0]["n_shuffle"],
         "holm_p": float("nan"),
@@ -311,7 +314,7 @@ def print_results(results, title="Statistical Analysis"):
     print(f"\n{'='*80}")
     print(f"  {title}")
     print(f"{'='*96}")
-    print(f"{'k_frac':>14} {'orig':>8} {'shuf':>8} {'delta':>8} {'CI_lo':>8} {'CI_hi':>8} {'raw_p':>9} {'holm_p':>9} {'sig(H)':>7}")
+    print(f"{'k_frac':>14} {'orig':>8} {'shuf':>8} {'delta':>8} {'CI_lo':>8} {'CI_hi':>8} {'p_2side':>9} {'holm_p':>9} {'sig(H)':>7}")
     print("-" * 96)
     for r in results:
         kf = r["k_frac"]
@@ -322,7 +325,7 @@ def print_results(results, title="Statistical Analysis"):
         sig_h = "YES" if r["significant_holm"] else "no"
         print(f"{kf:8.2f}   {r['orig_mean']:8.4f} {r['shuf_mean']:8.4f} {r['mean_delta']:+8.4f} "
               f"{r.get('ci_lo', float('nan')):8.4f} {r.get('ci_hi', float('nan')):8.4f} "
-              f"{r['raw_p']:9.5f} {r['holm_p']:9.5f} {sig_h:>7}")
+              f"{r['p_two_sided']:9.5f} {r['holm_p']:9.5f} {sig_h:>7}")
     print(f"{'='*96}")
 
 
@@ -388,20 +391,20 @@ def main():
                 stat, p_two = stats.mannwhitneyu([orig_mean], shuf_vals, alternative="two-sided")
             else:
                 stat, p_two = stats.ttest_1samp(np.array(shuf_vals) - orig_mean, 0.0)
-
-            p_one = float(p_two / 2.0) if delta > 0 else float(1.0 - p_two / 2.0)
+            if not np.isfinite(p_two):
+                p_two = 1.0
 
             results.append({
                 "k_frac": k,
                 "orig_mean": float(orig_mean),
                 "shuf_mean": float(shuf_mean),
                 "mean_delta": float(delta),
-                "raw_p": p_one,
+                "p_two_sided": float(p_two),
                 "n_shuffle": len(shuf_vals),
             })
 
         if results:
-            raw_p = np.array([r["raw_p"] for r in results])
+            raw_p = np.array([r["p_two_sided"] for r in results])
             holm_adj = holm_correction(raw_p)
             bh_adj = bh_fdr_correction(raw_p)
             for i, r in enumerate(results):
