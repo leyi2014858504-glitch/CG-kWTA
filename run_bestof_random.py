@@ -63,8 +63,10 @@ def run_one(ds, m, tag, args):
     content = re.sub(r'EXP_MODE\s*=\s*"[^"]*"', 'EXP_MODE = "bestof_random"', content)
     content = re.sub(r'DATASET\s*=\s*"[^"]*"', f'DATASET = "{ds}_{tag}"', content)
     content = re.sub(r'Shuffle_mode\s*=\s*(True|False)', "Shuffle_mode = False", content)
-    content = re.sub(r'^SEED_START\s*=\s*\d+', "SEED_START = 0", content, flags=re.M)
-    content = re.sub(r'^SEED_END\s*=\s*\d+', f'SEED_END = {args.seeds - 1}', content, flags=re.M)
+    # Tolerate the indentation of these constants inside __main__ (the old
+    # anchored pattern silently no-oped, leaving the file's own seed range).
+    content = re.sub(r'^\s*SEED_START\s*=\s*\d+', "    SEED_START = 0", content, flags=re.M)
+    content = re.sub(r'^\s*SEED_END\s*=\s*\d+', f"    SEED_END = {args.seeds - 1}", content, flags=re.M)
     data_dir_escaped = DATA_DIR.replace("\\", "\\\\")
     content = re.sub(r'DATA_DIR\s*=\s*"[^"]*"', f'DATA_DIR = r"{data_dir_escaped}"', content)
     base_escaped = BASE_DIR.replace("\\", "\\\\")

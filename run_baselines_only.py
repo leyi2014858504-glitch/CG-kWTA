@@ -4,6 +4,7 @@ across all models and datasets, using the same main script as the geo experiment
 
 Skipped automatically when all 10 seed result files already exist (resumable).
 """
+import argparse
 import os
 import subprocess
 import sys
@@ -106,12 +107,28 @@ def run_single_baseline(dataset, model_short, mode):
 
 
 def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--datasets", nargs="+", default=DATASETS,
+                    help=f"dataset keys, e.g. cifar10 stl10 imagenet100 (default: {DATASETS})")
+    ap.add_argument("--models", nargs="+", default=list(MODELS),
+                    help="model keys, e.g. r50 vitmae (default: all)")
+    ap.add_argument("--seeds", type=int, default=10)
+    args = ap.parse_args()
+
+    global SEED_END
+    SEED_END = args.seeds - 1
+
     print("=" * 80)
-    print(f"Baseline-only runs: {len(BASELINE_MODES)} modes x {len(MODELS)} models x {len(DATASETS)} datasets")
+    print(f"Baseline-only runs: {len(BASELINE_MODES)} modes x {len(args.models)} models "
+          f"x {len(args.datasets)} datasets, seeds {SEED_START}-{SEED_END}")
     print("=" * 80)
 
-    for dataset in DATASETS:
-        for model_short, (model_name, model_tag) in MODELS.items():
+    for dataset in args.datasets:
+        for model_short in args.models:
+            if model_short not in MODELS:
+                print(f"[warn] unknown model key: {model_short}")
+                continue
+            model_name, model_tag = MODELS[model_short]
             if not check_features_exist(dataset, model_tag):
                 print(f"[warn] missing features: {dataset}_{model_tag}, skip")
                 continue

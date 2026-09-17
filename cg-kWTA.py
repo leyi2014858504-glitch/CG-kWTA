@@ -18,7 +18,6 @@ from shuffle import shuffle_pts_rows_inplace
 from shuffle import  fitness_shuffle
 
 
-
 print("Imports done.")
 
 os.environ["OMP_NUM_THREADS"] = "1"
@@ -46,8 +45,28 @@ PTS_EXTERNAL_PATH = "./data/pts_stl10_r50_randproj.pt"
 
 #The shuffle test
 Shuffle_mode = False
+N_SHUFFLE_RUNS = 1  # >1 => multiple independent coordinate permutations (see sweep_kfrac_to_yaml wrapper)
 FITNESS_SHUFFLE_MODE = False
 FITNESS_SHUFFLE_SEED = 0   # True to enable
+
+# ---- sensitivity knobs (isolated controls; None keeps historical behaviour) ----
+# CALIB_SEED: which subset of the training set is used to build the coordinates
+#   (D_cal, `cma_train_n` rows). None -> the rows are drawn from the global RNG
+#   right after set_seed(seed), i.e. the calibration draw moves with `seed`.
+#   An int -> the rows are drawn from a dedicated generator with that seed, so
+#   the calibration split can be varied while the train/val split, the CMA
+#   search and the shuffle permutation all stay fixed at `seed`.
+CALIB_SEED = None
+# PROJ_SEED_OVERRIDE: seed of the random projection matrix used by RandProj
+#   coordinates. None -> proj_seed = seed (historical behaviour). An int ->
+#   varies only the projection directions, holding everything else fixed.
+PROJ_SEED_OVERRIDE = None
+
+# ---- cost accounting (Reviewer #4.5: wall-clock AND regression-solve costs) ----
+# Accumulates the time spent inside CmaEngine.f(), i.e. the search-time ridge
+# solves (one per candidate). Everything else in a k-point's elapsed_sec is
+# setup, coordinate lookups, the final refit on train+val and the test eval.
+SEARCH_TIMING = {"search_sec": 0.0, "n_search_solves": 0}
 
 
 
@@ -121,8 +140,6 @@ def compute_pts_meanvar_once(
     return out.detach()
 
 
-
-
 def compute_pts_randproj_once(
     backbone: nn.Module,
     calib_data: torch.Tensor,
@@ -191,6 +208,91 @@ def compute_pts_pca_once(
         pts_out[:, j] = _zscore(pts_out[:, j])
 
     return pts_out.detach()
+
+
+def compute_baseline_scores(
+    backbone: nn.Module,
+    calib_data: torch.Tensor,
+    mode: str,
+    num_classes: int,
+    calib_labels: torch.Tensor = None,
+    ridge_alpha: float = 1.0,
+    batch_size: int = 512,
+) -> torch.Tensor:
+    """
+    Compute per-neuron importance scores on D_cal (same budget as coordinate construction).
+    Returns: scores [H] on CPU.
+    """
+    backbone.eval()
+    ds = TensorDataset(calib_data)
+    loader = DataLoader(ds, batch_size=batch_size, shuffle=False)
+
+    if mode == "probe_weight":
+        # Fit ridge on calib features, return |W|_2 per neuron.
+        feats_all = []
+        with torch.no_grad():
+            for (x,) in loader:
+                feats_all.append(backbone(x.to(device)))
+        A = torch.cat(feats_all, dim=0)
+        mu = A.mean(dim=0, keepdim=True)
+        sig = A.std(dim=0, keepdim=True).clamp_min(1e-6)
+        A_z = (A - mu) / sig
+        Y = calib_labels.to(device).float()
+        Ymu = Y.mean(dim=0, keepdim=True)
+        Yc = Y - Ymu
+        XtX = A_z.float().T @ A_z.float()
+        H = XtX.shape[0]
+        XtX = XtX + float(ridge_alpha) * torch.eye(H, device=XtX.device, dtype=XtX.dtype)
+        XtY = A_z.float().T @ Yc.float()
+        L = torch.linalg.cholesky(XtX)
+        W = torch.cholesky_solve(XtY, L)  # [H, C]
+        scores = torch.norm(W, dim=1)
+        return scores.detach().cpu()
+
+    if mode == "magnitude":
+        acc = None
+        n = 0
+        with torch.no_grad():
+            for (x,) in loader:
+                feats = backbone(x.to(device))
+                if acc is None:
+                    acc = feats.abs().sum(dim=0)
+                else:
+                    acc += feats.abs().sum(dim=0)
+                n += feats.shape[0]
+        return (acc / max(1, n)).detach().cpu()
+
+    if mode == "variance":
+        s1 = s2 = None
+        n = 0
+        with torch.no_grad():
+            for (x,) in loader:
+                feats = backbone(x.to(device))
+                if s1 is None:
+                    s1 = feats.sum(dim=0)
+                    s2 = (feats * feats).sum(dim=0)
+                else:
+                    s1 += feats.sum(dim=0)
+                    s2 += (feats * feats).sum(dim=0)
+                n += feats.shape[0]
+        mean = s1 / max(1, n)
+        var = s2 / max(1, n) - mean * mean
+        return var.clamp(min=0).detach().cpu()
+
+    if mode == "rate":
+        acc = None
+        n = 0
+        with torch.no_grad():
+            for (x,) in loader:
+                feats = backbone(x.to(device))
+                if acc is None:
+                    acc = (feats > 0).float().sum(dim=0)
+                else:
+                    acc += (feats > 0).float().sum(dim=0)
+                n += feats.shape[0]
+        return (acc / max(1, n)).detach().cpu()
+
+    raise ValueError(f"Unknown baseline mode: {mode}")
 
 
 class Geo_kWTA(torch.nn.Module):
@@ -286,6 +388,10 @@ class MainModel(nn.Module):
         # Per-neuron coordinates (kept as-is for reproducibility under set_seed control).
         self.register_buffer("pts", torch.randn(hidden_dim, self.pts_dim) * 2)
 
+        # Precomputed importance scores for baseline gates (magnitude/variance/rate/probe_weight).
+        # Computed once on calib_data to avoid data leakage; same budget as coordinate construction.
+        self.register_buffer("precomputed_gate_scores", torch.zeros(hidden_dim))
+
         self.train_features = None
         self.train_labels = None
         self.val_features = None
@@ -339,22 +445,10 @@ class MainModel(nn.Module):
             gate = torch.zeros_like(scores)
             gate[topk_idx] = 1.0
             return gate
-        if self.gate_mode == "magnitude":
-            scores = features.abs().mean(dim=0)  # [hidden_dim]
-            k_num = max(1, int(scores.numel() * self.k_frac))
-            topk_idx = torch.topk(scores, k=k_num).indices
-            gate = torch.zeros_like(scores)
-            gate[topk_idx] = 1.0
-            return gate
-        if self.gate_mode == "variance":
-            scores = features.var(dim=0)  # [hidden_dim]
-            k_num = max(1, int(scores.numel() * self.k_frac))
-            topk_idx = torch.topk(scores, k=k_num).indices
-            gate = torch.zeros_like(scores)
-            gate[topk_idx] = 1.0
-            return gate
-        if self.gate_mode == "rate":
-            scores = (features > 0).float().mean(dim=0)  # [hidden_dim]
+        if self.gate_mode in ("magnitude", "variance", "rate", "probe_weight"):
+            # All baseline modes use precomputed scores (computed on calib_data once).
+            # This avoids data leakage: scores are always from the same D_cal used for coords.
+            scores = self.precomputed_gate_scores
             k_num = max(1, int(scores.numel() * self.k_frac))
             topk_idx = torch.topk(scores, k=k_num).indices
             gate = torch.zeros_like(scores)
@@ -382,7 +476,7 @@ class MainModel(nn.Module):
         backbone_params = sum(p.numel() for p in self.backbone.parameters() if p.requires_grad)
         geo_params = sum(p.numel() for p in self.geo_kwta.parameters() if p.requires_grad)
         output_params = sum(p.numel() for p in [self.cls_w, self.cls_b] if p.requires_grad)
-        print("Unfrozen params (should be 0):", backbone_params, "trainable geo params:", geo_params)
+        print("unfrozen parameters (expected 0):", backbone_params, "trainable geometry parameters:", geo_params)
         return backbone_params, geo_params, output_params
 
 
@@ -392,7 +486,7 @@ class MainModel(nn.Module):
         Works best when self.train_features/self.val_features are already on CUDA.
         """
         if self.train_features is None or self.val_features is None:
-            raise ValueError("call set_data() first to provide train/val data")
+            raise ValueError("call set_data() first to register the training and validation data")
 
         if alpha is None:
             alpha = self.ridge_alpha
@@ -562,8 +656,9 @@ class CmaEngine:
 
         self.es = cma.CMAEvolutionStrategy(self.x0, sigma0)
         self.pts = model.pts
+        self.history = []  # per-iteration best objective (fbest), for convergence curves
 
-        print(f"Initial sphere params: Radius={self.x0[0]:.4f}, Center={self.x0[1:]}")
+        print(f"initial sphere parameters: Radius={self.x0[0]:.4f}, Center={self.x0[1:]}")
 
     def f(self, x):
         # x: [radius, center_x, center_y, center_z] (when pts_dim=3)
@@ -575,28 +670,31 @@ class CmaEngine:
         self.layer.Radius.data = radius
         self.layer.Center.data = center
 
+        _t0 = time.perf_counter()
         try:
             mse_loss, accuracy, _ = self.model.evaluate_with_torch_ridge()
+            SEARCH_TIMING["search_sec"] += time.perf_counter() - _t0
+            SEARCH_TIMING["n_search_solves"] += 1
             if accuracy is None:
                 return mse_loss
             eps = 1e-3
             return float((1.0 - accuracy) / eps + mse_loss)
         except Exception as e:
-            print(f"Evaluation failed: {e}")
+            SEARCH_TIMING["search_sec"] += time.perf_counter() - _t0
+            SEARCH_TIMING["n_search_solves"] += 1
+            print(f"evaluation failed: {e}")
             return 1e6
 
     def step(self, maxiter: int = 20, verbose: bool = True):
         """
         Run CMA-ES optimization.
-        Returns: best_params, best_loss, best_accuracy, convergence_history
+        Returns: best_params, best_loss, best_accuracy
         """
         total_start_time = time.time()
 
         best_loss = float("inf")
         best_params = None
         best_accuracy = 0.0
-
-        convergence_history = []
 
         loop_start_time = time.time()
 
@@ -611,6 +709,7 @@ class CmaEngine:
                 values = fitness_shuffle(values, seed=FITNESS_SHUFFLE_SEED + i)
 
             self.es.tell(solutions, values)
+            self.history.append(float(self.es.result.fbest))
 
             if self.es.result.fbest < best_loss:
                 best_loss = self.es.result.fbest
@@ -626,24 +725,13 @@ class CmaEngine:
                 self.model.geo_kwta.Radius.data = radius
                 self.model.geo_kwta.Center.data = center
 
-            current_best_acc = None
-            try:
-                _, cur_acc, _ = self.model.evaluate_with_torch_ridge()
-                current_best_acc = cur_acc
-            except Exception:
-                pass
 
-            convergence_history.append({
-                "iter": i,
-                "fbest": float(self.es.result.fbest),
-                "best_acc": current_best_acc,
-            })
 
             if verbose and i % 10 == 0:
                 current_best = self.es.result.fbest
                 current_params = self.es.result.xbest
                 print(
-                    f"Iteration {i:3d}: best loss = {current_best:.6f}, "
+                    f"iter {i:3d}: best loss = {current_best:.6f}, "
                     f"params = [{current_params[0]:.4f}, {current_params[1]:.4f}], "
                     f"best accuracy = {best_accuracy:.4f}"
                 )
@@ -666,14 +754,14 @@ class CmaEngine:
                 best_accuracy = final_accuracy
             total_end_time = time.time() - total_start_time
 
-            print("\nOptimization done!")
-            print(f"Best sphere params: Major={best_params[0]:.6f}, Minor={best_params[1]:.6f}")
-            print(f"Best ridge loss: {best_loss:.6f}")
-            print(f"Best accuracy: {best_accuracy:.4f}")
-            print(f"CMA-ES time: {loop_end_time:.2f}s")
-            print(f"Total time: {total_end_time:.2f}s")
+            print("\noptimization finished.")
+            print(f"best sphere parameters: Major={best_params[0]:.6f}, Minor={best_params[1]:.6f}")
+            print(f"best ridge loss: {best_loss:.6f}")
+            print(f"best accuracy: {best_accuracy:.4f}")
+            print(f"CMA optimization time: {loop_end_time:.2f}")
+            print(f"total training time: {total_end_time:.2f}")
 
-        return best_params, best_loss, best_accuracy, convergence_history
+        return best_params, best_loss, best_accuracy
 
 
 def load_cifar10_via_torchvision(train_samples=1000, test_samples=200, data_dir="./data"):
@@ -719,10 +807,10 @@ def load_cifar10_via_torchvision(train_samples=1000, test_samples=200, data_dir=
     train_labels_onehot = F.one_hot(train_labels, num_classes=num_classes).float()
     test_labels_onehot = F.one_hot(test_labels, num_classes=num_classes).float()
 
-    print("[Data loaded - CIFAR-10]")
-    print(f"  Train: {train_data.shape} -> feature dim {train_data.shape[1]}, labels {train_labels_onehot.shape}")
-    print(f"  Test: {test_data.shape} -> feature dim {test_data.shape[1]}, labels {test_labels_onehot.shape}")
-    print(f"  Label sample: raw {train_labels[:5].tolist()}, One-Hot shape {train_labels_onehot[:1].shape}")
+    print("[data loaded - CIFAR-10]")
+    print(f" train set: {train_data.shape} -> feature dim {train_data.shape[1]}, labels {train_labels_onehot.shape}")
+    print(f" test set: {test_data.shape} -> feature dim {test_data.shape[1]}, labels {test_labels_onehot.shape}")
+    print(f" label example: raw {train_labels[:5].tolist()}, one-hot shape {train_labels_onehot[:1].shape}")
 
     return train_data, train_labels_onehot, test_data, test_labels_onehot
 
@@ -1015,6 +1103,26 @@ _DATASET_SPECS = {
 "stl10_mocov2":         dict(input_dim=2048, load=lambda tr,te,d,dl: loadcachedpt("stl10_mocov2",        tr,te,d,dl)),
 "stl10_swin":           dict(input_dim=1024, load=lambda tr,te,d,dl: loadcachedpt("stl10_swin",          tr,te,d,dl)),
 "stl10_dino":           dict(input_dim=768,  load=lambda tr,te,d,dl: loadcachedpt("stl10_dino",          tr,te,d,dl)),
+"imagenet100_r50": dict(
+    input_dim=2048,
+    load=lambda train_samples, test_samples, data_dir, download: loadcachedpt(
+        "imagenet100_r50", train_samples, test_samples, data_dir, download
+    ),
+),
+# T1: ImageNet-100 images downscaled to 96x96 before the 224 pipeline
+"imagenet100_r50_ds96": dict(
+    input_dim=2048,
+    load=lambda train_samples, test_samples, data_dir, download: loadcachedpt(
+        "imagenet100_r50_ds96", train_samples, test_samples, data_dir, download
+    ),
+),
+# T2: ImageNet-100 train subsampled to ~45k images (same features otherwise)
+"imagenet100_r50_sub45k": dict(
+    input_dim=2048,
+    load=lambda train_samples, test_samples, data_dir, download: loadcachedpt(
+        "imagenet100_r50_sub45k", train_samples, test_samples, data_dir, download
+    ),
+),
 
 
 
@@ -1117,6 +1225,9 @@ def sweep_kfrac_to_yaml(
     n_shuffle_runs=1,
     shuffle_seed_offset=0,
 ):
+    """Wrapper: when Shuffle_mode is on and n_shuffle_runs > 1, run multiple
+    independent coordinate permutations (rep files + a _multi_shuffle.yaml index)
+    to characterize the null for paired significance testing."""
     global Shuffle_mode
     if Shuffle_mode and n_shuffle_runs > 1:
         results_agg = {"meta": {"n_shuffle_runs": n_shuffle_runs, "seeds": []}, "runs_by_repeat": []}
@@ -1193,7 +1304,11 @@ def _sweep_single(
     "cifar10_dino",
     "cifar10_swin","cifar100_vit_mae","stl10_vit_mae","cifar100_dino","stl10_dino","cifar100_convnext_base_sup",
                                 "cifar100_convnextv2_base_mae","stl10_convnextv2_base_mae","stl10_convnext_base_sup",
-                                "cifar100_swin","stl10_swin","cifar10_vit" , "cifar100_vit", "stl10_vit","stl10_mocov2","cifar100_mocov2"}
+                                "cifar100_swin","stl10_swin","cifar10_vit" , "cifar100_vit", "stl10_vit","stl10_mocov2","cifar100_mocov2",
+                                # ImageNet-100 (frozen ResNet-50). MUST be listed here,
+                                # otherwise backbone_type falls back to "mlp" and the gate
+                                # selects 512 MLP hidden units instead of the 2048 neurons.
+                                "imagenet100_r50", "imagenet100_r50_ds96", "imagenet100_r50_sub45k"}
     for layer_idx in range(VITMAE_NUM_LAYERS):
         _cached_feature_datasets.add(f"cifar10vitmae_layer{layer_idx:02d}")
     for layer_idx in range(VITMAE_NUM_LAYERS):
@@ -1227,7 +1342,7 @@ def _sweep_single(
 
     # ---- NEW: fixed pts for geo mode (shared across all k_frac) ----
     pts_fixed = None
-    if gate_mode == "geo" and GEO_PTS_INIT in ["meanvar", "randproj", "external","pca"]:
+    if gate_mode == "geo" and GEO_PTS_INIT in ["meanvar", "randproj", "external", "pca"]:
         set_seed(seed)
 
         if GEO_PTS_INIT == "external":
@@ -1239,7 +1354,11 @@ def _sweep_single(
         else:
             # meanvar / randproj need a probe model and calib_data
             calib_n = min(cma_train_n, train_data.shape[0])
-            calib_idx = torch.randperm(train_data.shape[0])[:calib_n]
+            if CALIB_SEED is None:
+                calib_idx = torch.randperm(train_data.shape[0])[:calib_n]
+            else:
+                _calib_gen = torch.Generator().manual_seed(int(CALIB_SEED))
+                calib_idx = torch.randperm(train_data.shape[0], generator=_calib_gen)[:calib_n]
             calib_data = train_data[calib_idx].to(device)
 
             probe = MainModel(
@@ -1265,7 +1384,7 @@ def _sweep_single(
                     calib_data=calib_data,
                     pts_dim=pd,
                     batch_size=512,
-                    proj_seed=seed,
+                    proj_seed=(seed if PROJ_SEED_OVERRIDE is None else int(PROJ_SEED_OVERRIDE)),
                 )
             elif GEO_PTS_INIT == "pca":
                 pts_fixed = compute_pts_pca_once(
@@ -1282,7 +1401,37 @@ def _sweep_single(
             print("pts_fixed:", pts_fixed.shape)
             del probe
 
+    # ---- Precompute baseline importance scores (same D_cal budget) ----
+    baseline_scores_fixed = None
+    if gate_mode in ("magnitude", "variance", "rate", "probe_weight"):
+        set_seed(seed)
+        calib_n = min(cma_train_n, train_data.shape[0])
+        calib_idx = torch.randperm(train_data.shape[0])[:calib_n]
+        calib_data_bl = train_data[calib_idx].to(device)
+        calib_labels_bl = train_labels[calib_idx]
 
+        probe_bl = MainModel(
+            input_dim=input_dim,
+            hidden_dim=hidden_dim_eff,
+            output_dim=num_classes,
+            k_frac=0.5,
+            gate_mode="geo",
+            pts_dim=pd,
+            backbone_type=backbone_type,
+        ).to(device)
+
+        baseline_scores_fixed = compute_baseline_scores(
+            backbone=probe_bl.backbone,
+            calib_data=calib_data_bl,
+            mode=gate_mode,
+            num_classes=num_classes,
+            calib_labels=calib_labels_bl,
+            ridge_alpha=ridge_alpha,
+            batch_size=512,
+        )
+        print(f"Baseline scores ({gate_mode}): shape={baseline_scores_fixed.shape}, "
+              f"min={baseline_scores_fixed.min():.4f}, max={baseline_scores_fixed.max():.4f}")
+        del probe_bl
 
     # ---------------------------------------------------------------
 
@@ -1296,6 +1445,8 @@ def _sweep_single(
     for k_frac in k_list:
         # Keep randomness identical across k_frac (controlled variables).
         t0 = time.time()
+        SEARCH_TIMING["search_sec"] = 0.0
+        SEARCH_TIMING["n_search_solves"] = 0
         set_seed(seed)
 
         Ntr = train_data.shape[0]
@@ -1322,6 +1473,9 @@ def _sweep_single(
         if pts_fixed is not None:
             model.pts.copy_(pts_fixed)
 
+        if baseline_scores_fixed is not None:
+            model.precomputed_gate_scores.copy_(baseline_scores_fixed)
+
         if Shuffle_mode == True:
             shuffle_pts_rows_inplace(model, seed=shuffle_seed)
 
@@ -1329,7 +1483,7 @@ def _sweep_single(
 
         # (A)/(B) Gate selection on train/val (NO test used)
         best_params, best_loss, best_acc = None, None, None
-        convergence_history = []
+        cma_history = None
 
         if gate_mode == "geo":
             model.set_data(
@@ -1340,7 +1494,8 @@ def _sweep_single(
             )
             initial_loss, initial_acc, _ = model.evaluate_with_torch_ridge()
             optimizer = CmaEngine(model)
-            best_params, best_loss, best_acc, convergence_history = optimizer.step(maxiter=maxiter, verbose=False)
+            best_params, best_loss, best_acc = optimizer.step(maxiter=maxiter, verbose=False)
+            cma_history = optimizer.history
 
         elif gate_mode == "bestof_random":
             # Use full train/val split for selection (NO test), and match *total* gate-evaluation budget to geo's two-stage CMA
@@ -1413,8 +1568,12 @@ def _sweep_single(
                 "active_ratio": float(stats["active_ratio"]),
                 "active_neurons": int(stats["active_neurons"]),
                 "total_neurons": int(stats["total_neurons"]),
+                "cma_fbest_history": None if cma_history is None else [float(v) for v in cma_history],
                 "elapsed_sec": float(dt),
-                "convergence": convergence_history if convergence_history else None,
+                # cost breakdown: search-time ridge solves vs the rest
+                "search_sec": float(SEARCH_TIMING["search_sec"]),
+                "n_search_solves": int(SEARCH_TIMING["n_search_solves"]),
+                "search_frac": (float(SEARCH_TIMING["search_sec"]) / float(dt)) if dt > 0 else None,
             }
         )
 
@@ -1532,7 +1691,7 @@ def run_semantic_experiment(
     
     print(f"Training gate on Train/Val with k_frac={k_frac}...")
     optimizer = CmaEngine(model)
-    best_params, best_loss, best_acc, _ = optimizer.step(maxiter=maxiter, verbose=False)
+    best_params, best_loss, best_acc = optimizer.step(maxiter=maxiter, verbose=False)
     
     # Set best params
     if best_params is not None:
@@ -1649,34 +1808,25 @@ def run_semantic_experiment(
 if __name__ == "__main__":
     # ----------------- USER SWITCHES  -----------------
     # EXP_MODE:
-    #   "geo_r"      -> Geo gate + random projection pts
-    #   "random"     -> pure random mask baseline
-    #   "geo_m"      -> Geo gate + meanvar pts
-    #   "kwta"       -> Global kWTA method (top-k by mean activation)
-    #   "magnitude"  -> baseline: top-k by |activation|
-    #   "variance"   -> baseline: top-k by activation variance
-    #   "rate"       -> baseline: top-k by activation rate
+    #   "geo_r"  -> Geo gate + random projection pts   => results_kfrac_geo_r{seed}.yaml
+    #   "random" -> pure random mask baseline          => results_kfrac_random{seed}.yaml
+    #   "geo_m"  -> Geo gate + meanvar pts             => results_kfrac_geo_m{seed}.yaml
+    #   "kwta"   -> Global kWTA method                 => results_kfrac_geo
     #   "semantic_test"
-    EXP_MODE = "magnitude"
+    EXP_MODE = "geo_r"
 
     SEED_START = 0
     SEED_END = 9 # inclusive
 
 
     MAXITER = 20 #You can set it as "0" if you wanna run random or kwta mode.
+    # Samples used for coordinate calibration and per-candidate CMA evaluation.
+    # Larger values = each gate candidate is scored on more data (slower search,
+    # but removes the "the search was starved of data" explanation at scale).
+    CMA_TRAIN_N = 4000
+    CMA_VAL_N = 800
     DATASET = "cifar10_r50" #mnist cifar10 cifar10_r50 cifar10_vitmae
     DATA_DIR = "./data"
-    N_SHUFFLE_RUNS = 1  # Number of independent shuffle repeats for significance testing
-    # Override pd from command line: python cg-kWTA.py --pd 5
-    import sys as _sys
-    _pd_override = None
-    if "--pd" in _sys.argv:
-        _idx = _sys.argv.index("--pd")
-        if _idx + 1 < len(_sys.argv):
-            _pd_override = int(_sys.argv[_idx + 1])
-    if _pd_override is not None:
-        pd = _pd_override
-        print(f"[CLI] Overriding pd = {pd}")
     # ---------------------------------------------------------------
 
     print(f"Starting experiment loop. EXP_MODE={EXP_MODE}, SEED_START={SEED_START}, SEED_END={SEED_END}")
@@ -1696,7 +1846,9 @@ if __name__ == "__main__":
                 dataset=DATASET,
                 data_dir=DATA_DIR,
                 n_shuffle_runs=N_SHUFFLE_RUNS,
-                shuffle_seed_offset=0,
+                shuffle_seed_offset=sd,
+                cma_train_n=CMA_TRAIN_N,
+                cma_val_n=CMA_VAL_N,
             )
         elif EXP_MODE == "random":
             GEO_PTS_INIT = "randn"  # irrelevant for random gate, kept explicit
@@ -1723,53 +1875,19 @@ if __name__ == "__main__":
                 dataset=DATASET,
                 data_dir=DATA_DIR,
                 n_shuffle_runs=N_SHUFFLE_RUNS,
-                shuffle_seed_offset=100,
+                shuffle_seed_offset=sd,
+                cma_train_n=CMA_TRAIN_N,
+                cma_val_n=CMA_VAL_N,
             )
         elif EXP_MODE == "kwta":
             GEO_PTS_INIT = "randn"  # pts is useless in this mode
             gate_mode = "kwta"
-            out_path = f"results_{DATASET}_kwta_sd{sd}.yaml"
+            out_path = f"results_kfrac_kwta_sd{sd}.yaml"
             sweep_kfrac_to_yaml(
                 out_path=out_path,
                 seed=sd,
                 gate_mode=gate_mode,
                 maxiter=MAXITER,
-                dataset=DATASET,
-                data_dir=DATA_DIR,
-            )
-        elif EXP_MODE == "magnitude":
-            GEO_PTS_INIT = "randn"
-            gate_mode = "magnitude"
-            out_path = f"results_{DATASET}_magnitude_sd{sd}.yaml"
-            sweep_kfrac_to_yaml(
-                out_path=out_path,
-                seed=sd,
-                gate_mode=gate_mode,
-                maxiter=0,
-                dataset=DATASET,
-                data_dir=DATA_DIR,
-            )
-        elif EXP_MODE == "variance":
-            GEO_PTS_INIT = "randn"
-            gate_mode = "variance"
-            out_path = f"results_{DATASET}_variance_sd{sd}.yaml"
-            sweep_kfrac_to_yaml(
-                out_path=out_path,
-                seed=sd,
-                gate_mode=gate_mode,
-                maxiter=0,
-                dataset=DATASET,
-                data_dir=DATA_DIR,
-            )
-        elif EXP_MODE == "rate":
-            GEO_PTS_INIT = "randn"
-            gate_mode = "rate"
-            out_path = f"results_{DATASET}_rate_sd{sd}.yaml"
-            sweep_kfrac_to_yaml(
-                out_path=out_path,
-                seed=sd,
-                gate_mode=gate_mode,
-                maxiter=0,
                 dataset=DATASET,
                 data_dir=DATA_DIR,
             )
@@ -1823,7 +1941,56 @@ if __name__ == "__main__":
                 dataset=DATASET,
                 data_dir=DATA_DIR,
                 n_shuffle_runs=N_SHUFFLE_RUNS,
-                shuffle_seed_offset=200,)
+                shuffle_seed_offset=sd,)
+
+        elif EXP_MODE == "magnitude":
+            GEO_PTS_INIT = "randn"  # pts is useless in this mode
+            gate_mode = "magnitude"
+            out_path = f"results_{DATASET}_magnitude_sd{sd}.yaml"
+            sweep_kfrac_to_yaml(
+                out_path=out_path,
+                seed=sd,
+                gate_mode=gate_mode,
+                maxiter=0,
+                dataset=DATASET,
+                data_dir=DATA_DIR,
+            )
+        elif EXP_MODE == "variance":
+            GEO_PTS_INIT = "randn"  # pts is useless in this mode
+            gate_mode = "variance"
+            out_path = f"results_{DATASET}_variance_sd{sd}.yaml"
+            sweep_kfrac_to_yaml(
+                out_path=out_path,
+                seed=sd,
+                gate_mode=gate_mode,
+                maxiter=0,
+                dataset=DATASET,
+                data_dir=DATA_DIR,
+            )
+        elif EXP_MODE == "rate":
+            GEO_PTS_INIT = "randn"  # pts is useless in this mode
+            gate_mode = "rate"
+            out_path = f"results_{DATASET}_rate_sd{sd}.yaml"
+            sweep_kfrac_to_yaml(
+                out_path=out_path,
+                seed=sd,
+                gate_mode=gate_mode,
+                maxiter=0,
+                dataset=DATASET,
+                data_dir=DATA_DIR,
+            )
+        elif EXP_MODE == "probe_weight":
+            GEO_PTS_INIT = "randn"  # pts is useless in this mode
+            gate_mode = "probe_weight"
+            out_path = f"results_{DATASET}_probe_weight_sd{sd}.yaml"
+            sweep_kfrac_to_yaml(
+                out_path=out_path,
+                seed=sd,
+                gate_mode=gate_mode,
+                maxiter=0,
+                dataset=DATASET,
+                data_dir=DATA_DIR,
+            )
 
         else:
             raise ValueError(f"Unknown EXP_MODE: {EXP_MODE}")

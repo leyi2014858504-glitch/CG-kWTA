@@ -17,6 +17,7 @@ Usage:
     python run_rebuttal_experiments.py --models r50 vit vitmae --datasets cifar10 cifar100 stl10 --seeds 5
 """
 import argparse
+import glob
 import os
 import re
 import sys
@@ -54,11 +55,13 @@ def make_temp(out_folder, exp_mode, ds, tag, shuffle, n_shuffle_runs, pd=None,
     content = re.sub(r'DATASET\s*=\s*"[^"]*"', f'DATASET = "{ds}_{tag}"', content)
     content = re.sub(r'Shuffle_mode\s*=\s*(True|False)', f'Shuffle_mode = {shuffle}', content)
     content = re.sub(r'N_SHUFFLE_RUNS\s*=\s*\d+', f'N_SHUFFLE_RUNS = {n_shuffle_runs}', content)
-    content = re.sub(r'^MAXITER\s*=\s*\d+', f'MAXITER = {maxiter}', content, flags=re.M)
-    content = re.sub(r'^SEED_START\s*=\s*\d+', f'SEED_START = {seed_start}', content, flags=re.M)
-    content = re.sub(r'^SEED_END\s*=\s*\d+', f'SEED_END = {seed_end}', content, flags=re.M)
+    # NOTE: these constants are indented inside __main__ / module scope; the
+    # patterns must tolerate leading whitespace or the substitution silently no-ops.
+    content = re.sub(r'^\s*MAXITER\s*=\s*\d+', f'    MAXITER = {maxiter}', content, flags=re.M)
+    content = re.sub(r'^\s*SEED_START\s*=\s*\d+', f'    SEED_START = {seed_start}', content, flags=re.M)
+    content = re.sub(r'^\s*SEED_END\s*=\s*\d+', f'    SEED_END = {seed_end}', content, flags=re.M)
     if pd is not None:
-        content = re.sub(r'^pd\s*=\s*\d+', f'pd = {pd}', content, flags=re.M)
+        content = re.sub(r'^\s*pd\s*=\s*\d+', f'pd = {pd}', content, flags=re.M)
     data_dir_escaped = DATA_DIR.replace("\\", "\\\\")
     content = re.sub(r'DATA_DIR\s*=\s*"[^"]*"', f'DATA_DIR = r"{data_dir_escaped}"', content)
     base_escaped = BASE_DIR.replace("\\", "\\\\")
@@ -71,13 +74,18 @@ def make_temp(out_folder, exp_mode, ds, tag, shuffle, n_shuffle_runs, pd=None,
 
 
 def run_script(temp_script, out_folder, label):
+    """Run one temp script as an isolated subprocess. Returns True on success.
+    A fresh process per call = a fresh CUDA context, so a transient
+    'illegal memory access' (which is sticky/unrecoverable within a process)
+    only kills this call and can be retried."""
     try:
         r = subprocess.run([sys.executable, temp_script], cwd=out_folder,
                            capture_output=True, text=True, encoding="utf-8", errors="replace")
         if r.returncode != 0:
-            print(f"[FAIL] {label}\n{r.stderr[-1500:]}")
-        else:
-            print(f"[OK] {label}")
+            print(f"[FAIL] {label}\n{(r.stderr or '')[-1500:]}")
+            return False
+        print(f"[OK] {label}")
+        return True
     finally:
         if os.path.exists(temp_script):
             os.remove(temp_script)
@@ -98,23 +106,63 @@ def is_yaml_complete(path, min_runs=20):
 
 
 # ---- (A) multi-shuffle geo ----
-def multi_shuffle_done(out_folder, ds, tag, exp_mode, n_seeds):
-    for sd in range(n_seeds):
-        idx = os.path.join(out_folder, f"results_{ds}_{tag}_{exp_mode}_shuf_sd{sd}_multi_shuffle.yaml")
-        if not os.path.exists(idx):
+def seed_shuf_done(out_folder, sd, n_reps):
+    """Per-seed resume: the seed is done only if its multi_shuffle index exists
+    AND every rep file is 20-k-complete (glob so it works for geo_r, whose
+    filenames carry a '_sigma0.50' segment, and geo_m, which does not)."""
+    if not glob.glob(os.path.join(out_folder, f"results_*_shuf_sd{sd}_multi_shuffle.yaml")):
+        return False
+    for rep in range(n_reps):
+        reps = glob.glob(os.path.join(out_folder, f"results_*_shuf_sd{sd}_rep{rep}.yaml"))
+        if not any(is_yaml_complete(p) for p in reps):
             return False
     return True
 
 
 def run_multi_shuffle(ds, m, tag, coord, args):
+    """Launch one isolated subprocess PER SEED so a transient CUDA illegal
+    access kills only that seed; retry each seed with a fresh context."""
     exp_mode = COORD_EXP[coord]
-    out_folder = os.path.join(BASE_DIR, "rebuttal", f"{ds}_{m}_{coord}")
-    if multi_shuffle_done(out_folder, ds, tag, exp_mode, args.seeds):
-        print(f"[skip] multi-shuffle {ds}/{m}/{coord}")
+    out_folder = os.path.join(BASE_DIR, args.out_root, f"{ds}_{m}_{coord}")
+    for sd in range(args.seeds):
+        if seed_shuf_done(out_folder, sd, args.shuffle_runs):
+            print(f"[skip] multi-shuffle {ds}/{m}/{coord} sd{sd}")
+            continue
+        for attempt in range(1, args.retries + 1):
+            ts = make_temp(out_folder, exp_mode, ds, tag, shuffle=True,
+                           n_shuffle_runs=args.shuffle_runs,
+                           seed_start=sd, seed_end=sd, maxiter=args.maxiter)
+            label = f"multi-shuffle {ds}/{m}/{coord} sd{sd} (run {args.shuffle_runs}, try {attempt})"
+            if run_script(ts, out_folder, label):
+                break
+        else:
+            print(f"[GIVEUP] {ds}/{m}/{coord} sd{sd} after {args.retries} attempts")
+
+
+# ---- (A2) matched originals in the SAME output folder (needed for budget
+# controls: the result filenames do NOT encode maxiter, so a longer-budget
+# run MUST live in its own --out-root to avoid clobbering maxiter=20 evidence)
+def orig_yaml_name(ds, tag, exp_mode, sd):
+    if exp_mode == "geo_r":
+        return f"results_{ds}_{tag}_geo_r_sigma0.50_sd{sd}.yaml"
+    return f"results_{ds}_{tag}_{exp_mode}_sd{sd}.yaml"
+
+
+def orig_done(out_folder, ds, tag, exp_mode, n_seeds):
+    return all(is_yaml_complete(
+        os.path.join(out_folder, orig_yaml_name(ds, tag, exp_mode, sd)))
+        for sd in range(n_seeds))
+
+
+def run_orig(ds, m, tag, coord, args):
+    exp_mode = COORD_EXP[coord]
+    out_folder = os.path.join(BASE_DIR, args.out_root, f"{ds}_{m}_{coord}")
+    if orig_done(out_folder, ds, tag, exp_mode, args.seeds):
+        print(f"[skip] orig {ds}/{m}/{coord}")
         return
-    ts = make_temp(out_folder, exp_mode, ds, tag, shuffle=True,
-                   n_shuffle_runs=args.shuffle_runs, seed_end=args.seeds - 1, maxiter=args.maxiter)
-    run_script(ts, out_folder, f"multi-shuffle {ds}/{m}/{coord} (runs={args.shuffle_runs})")
+    ts = make_temp(out_folder, exp_mode, ds, tag, shuffle=False,
+                   n_shuffle_runs=1, seed_end=args.seeds - 1, maxiter=args.maxiter)
+    run_script(ts, out_folder, f"orig {ds}/{m}/{coord} (maxiter={args.maxiter})")
 
 
 # ---- (B) d-sweep (geo_r, orig + shuf) ----
@@ -147,10 +195,23 @@ def main():
                     help="number of independent coordinate permutations (R4.3)")
     ap.add_argument("--seeds", type=int, default=10)
     ap.add_argument("--maxiter", type=int, default=20)
+    ap.add_argument("--out-root", default="rebuttal",
+                    help="folder under BASE_DIR for part A outputs; use a distinct "
+                         "root (e.g. rebuttal_maxiter40) for longer-budget controls, "
+                         "because result filenames do not encode maxiter")
+    ap.add_argument("--retries", type=int, default=3,
+                    help="attempts per seed for multi-shuffle (each in a fresh "
+                         "process/context, to survive transient CUDA faults)")
+    ap.add_argument("--with-orig", action="store_true",
+                    help="also run non-shuffled originals into --out-root "
+                         "(matched orig vs multi-shuffle at the same budget)")
+    ap.add_argument("--skip-dim", action="store_true",
+                    help="skip the coordinate-dimension d-sweep part")
     args = ap.parse_args()
 
     print(f"Rebuttal schedule: models={args.models} datasets={args.datasets} "
-          f"coords={args.coords} dims={args.dims} shuffle_runs={args.shuffle_runs} seeds={args.seeds}")
+          f"coords={args.coords} dims={args.dims} shuffle_runs={args.shuffle_runs} "
+          f"seeds={args.seeds} maxiter={args.maxiter} out_root={args.out_root}")
     for ds in args.datasets:
         for m in args.models:
             tag = MODELS[m]
@@ -159,9 +220,12 @@ def main():
                 continue
             for coord in args.coords:
                 run_multi_shuffle(ds, m, tag, coord, args)
-            for d in args.dims:
-                run_dim(ds, m, tag, d, args, shuffle=False)
-                run_dim(ds, m, tag, d, args, shuffle=True)
+                if args.with_orig:
+                    run_orig(ds, m, tag, coord, args)
+            if not args.skip_dim:
+                for d in args.dims:
+                    run_dim(ds, m, tag, d, args, shuffle=False)
+                    run_dim(ds, m, tag, d, args, shuffle=True)
     print("All rebuttal experiments scheduled.")
 
 

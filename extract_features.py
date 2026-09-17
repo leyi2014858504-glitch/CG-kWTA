@@ -47,6 +47,14 @@ def build_dataset(name, root, transform):
     elif name == "stl10":
         return (datasets.STL10(root, split="train", download=True, transform=transform),
                 datasets.STL10(root, split="test",  download=True, transform=transform))
+    elif name == "imagenet100":
+        # ImageFolder layout: {root}/imagenet100/train/<class>/*.JPEG
+        #                     {root}/imagenet100/val/<class>/*.JPEG
+        # Class indices come from the alphabetical class-dir order, which is
+        # identical for train and val (both contain all 100 classes).
+        in100 = os.path.join(root, "imagenet100")
+        return (datasets.ImageFolder(os.path.join(in100, "train"), transform=transform),
+                datasets.ImageFolder(os.path.join(in100, "val"),   transform=transform))
     raise ValueError(f"Unknown dataset: {name}")
 
 def build_mocov2(ckpt_path: str) -> nn.Module:

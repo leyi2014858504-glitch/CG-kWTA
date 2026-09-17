@@ -1,0 +1,14 @@
+meta:
+  n_shuffle_runs: 5
+  seeds:
+  - 7
+  - 8
+  - 9
+  - 10
+  - 11
+runs_by_repeat:
+- results_cifar10_r50_geo_r_shuf_sigma0.50_sd7_rep0.yaml
+- results_cifar10_r50_geo_r_shuf_sigma0.50_sd7_rep1.yaml
+- results_cifar10_r50_geo_r_shuf_sigma0.50_sd7_rep2.yaml
+- results_cifar10_r50_geo_r_shuf_sigma0.50_sd7_rep3.yaml
+- results_cifar10_r50_geo_r_shuf_sigma0.50_sd7_rep4.yaml
