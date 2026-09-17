@@ -21,6 +21,12 @@ _dbg_maxiter40/
 archive.zip
 package_rebuttal_yaml.zip
 Revisions.tex
+cgkwta.tex
+revision/
+revision_outline.md
+
+# latex build output
+build/
 
 # OS files
 Thumbs.db
