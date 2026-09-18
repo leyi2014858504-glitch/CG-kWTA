@@ -39,32 +39,36 @@ DEV = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 KS = [0.05, 0.10, 0.15, 0.20, 0.25, 0.30, 0.50]
 
 CONFIGS = {
-    # name: (feature_tag, orig_folder, orig_yaml, shuf_folder, shuf_yaml, pts_kind)
+    # name: (feature_tag, orig_folder, orig_yaml, shuf_folder, shuf_yaml,
+    #        pts_kind, n_seeds, n_shuf_reps)
+    # n_shuf_reps must equal the number of permutations the main analysis
+    # averages for that configuration, so the alpha=1 column reproduces the
+    # main paired tables rather than a single permutation.
     "cifar10_r50_geo_m": (
         "cifar10_r50", os.path.join(BASE, "cifar10_r50_meanstdrate"),
         "results_cifar10_r50_geo_m_sd{sd}.yaml",
         os.path.join(BASE, "rebuttal", "cifar10_r50_geo_m"),
-        "results_cifar10_r50_geo_m_shuf_sd{sd}_rep0.yaml", "meanvar", 10),
+        "results_cifar10_r50_geo_m_shuf_sd{sd}_rep{rep}.yaml", "meanvar", 10, 5),
     "cifar10_r50_geo_r": (
         "cifar10_r50", os.path.join(BASE, "rebuttal_dim", "cifar10_r50_d3"),
         "results_cifar10_r50_geo_r_sigma0.50_sd{sd}.yaml",
         os.path.join(BASE, "rebuttal", "cifar10_r50_geo_r"),
-        "results_cifar10_r50_geo_r_shuf_sigma0.50_sd{sd}_rep0.yaml", "randproj", 10),
+        "results_cifar10_r50_geo_r_shuf_sigma0.50_sd{sd}_rep{rep}.yaml", "randproj", 10, 5),
     "imagenet100_r50_geo_r": (
         "imagenet100_r50", os.path.join(BASE, "imagenet100_r50_fixed_geo_r"),
         "results_imagenet100_r50_geo_r_sigma0.50_sd{sd}.yaml",
         os.path.join(BASE, "imagenet100_r50_fixed_geo_r"),
-        "results_imagenet100_r50_geo_r_shuf_sigma0.50_sd{sd}.yaml", "randproj", 5),
+        "results_imagenet100_r50_geo_r_shuf_sigma0.50_sd{sd}.yaml", "randproj", 10, 1),
     "imagenet100_r50_geo_m": (
         "imagenet100_r50", os.path.join(BASE, "imagenet100_r50_fixed_geo_m"),
         "results_imagenet100_r50_geo_m_sd{sd}.yaml",
         os.path.join(BASE, "imagenet100_r50_fixed_geo_m"),
-        "results_imagenet100_r50_geo_m_shuf_sd{sd}.yaml", "meanvar", 5),
+        "results_imagenet100_r50_geo_m_shuf_sd{sd}.yaml", "meanvar", 10, 1),
     "vitmae_cifar10_geo_r": (
         "cifar10_vit_mae", os.path.join(BASE, "rebuttal_mae_verify", "cifar10_vitmae"),
         "results_cifar10_vit_mae_geo_r_sigma0.50_sd{sd}.yaml",
         os.path.join(BASE, "rebuttal_mae_verify", "cifar10_vitmae"),
-        "results_cifar10_vit_mae_geo_r_shuf_sigma0.50_sd{sd}.yaml", "randproj", 10),
+        "results_cifar10_vit_mae_geo_r_shuf_sigma0.50_sd{sd}.yaml", "randproj", 10, 1),
 }
 
 
@@ -148,8 +152,9 @@ def permute_pts(pts, seed):
 
 
 def run_config(name, args):
-    tag, ofolder, opat, sfolder, spat, pts_kind, n_seeds = CONFIGS[name]
-    print(f"\n{'='*78}\n{name}  (features={tag}, seeds={n_seeds})\n{'='*78}")
+    tag, ofolder, opat, sfolder, spat, pts_kind, n_seeds, n_reps = CONFIGS[name]
+    print(f"\n{'='*78}\n{name}  (features={tag}, seeds={n_seeds}, "
+          f"shuf reps={n_reps})\n{'='*78}")
     Xtr, ytr, Xte, yte = load_feats(tag)
     ytr = ytr.long().to(DEV)
     yte = yte.long().to(DEV)
@@ -161,25 +166,33 @@ def run_config(name, args):
     rows = []
     for sd in range(n_seeds):
         op = os.path.join(ofolder, opat.format(sd=sd))
-        sp = os.path.join(sfolder, spat.format(sd=sd))
         ptsp = os.path.join(ofolder, f"pts_fixed_seed{sd}_{pts_kind}.pt")
-        if not (os.path.exists(op) and os.path.exists(sp) and os.path.exists(ptsp)):
+        spaths = [os.path.join(sfolder, spat.format(sd=sd, rep=r)) for r in range(n_reps)]
+        if not (os.path.exists(op) and os.path.exists(ptsp)
+                and all(os.path.exists(p) for p in spaths)):
             print(f"  [skip] sd{sd}: missing artifact")
             continue
         pts = torch.load(ptsp, map_location="cpu")["pts_fixed"].float()
         oy = yaml.safe_load(open(op, encoding="utf-8"))
-        sy = yaml.safe_load(open(sp, encoding="utf-8"))
         o_runs = {round(float(r["k_frac"]), 2): r for r in oy["runs"]}
-        s_runs = {round(float(r["k_frac"]), 2): r for r in sy["runs"]}
-        pts_shuf = permute_pts(pts, sd)
+        # The main analysis averages the permutations within a seed; read each
+        # repeat's own optimized center and reproduce its own permutation seed
+        # (shuffle_seed_offset = sd, rep_seed = sd + rep).
+        s_runs = []
+        for r, p in enumerate(spaths):
+            sy = yaml.safe_load(open(p, encoding="utf-8"))
+            s_runs.append({round(float(x["k_frac"]), 2): x for x in sy["runs"]})
+        pts_shuf = [permute_pts(pts, sd + r) for r in range(n_reps)]
 
-        # correctness gate: the rebuilt ridge must reproduce BOTH archived arms
-        # (the shuffled arm also validates the permutation reproduction)
+        # correctness gate: the rebuilt ridge must reproduce EVERY archived arm,
+        # including each permutation (which also validates the reproduction)
         gate_ok = True
         for k in KS:
-            if k not in o_runs or k not in s_runs:
+            if k not in o_runs:
                 continue
-            for arm, pmat, yml in (("orig", pts, o_runs), ("shuf", pts_shuf, s_runs)):
+            for arm, pmat, yml in [(("orig", pts, o_runs))] + [
+                    (f"shuf{r}", pts_shuf[r], s_runs[r]) for r in range(n_reps)
+                    if k in s_runs[r]]:
                 sel = selected_idx(pmat, torch.tensor(yml[k]["best_center"], dtype=torch.float32), k)
                 A, B = prep(sel, Xtr, Xte)
                 got = acc_ridge(A, B, Yc, Ymu, yte, 1.0)
@@ -189,30 +202,40 @@ def run_config(name, args):
                     print(f"  [WARN] sd{sd} k={k} {arm}: rebuilt {got:.4f} != archived {arch:.4f}")
                 del A, B
         if args.validate_only:
-            print(f"  sd{sd}: orig reconstruction {'OK' if gate_ok else 'MISMATCH'}")
+            print(f"  sd{sd}: reconstruction {'OK' if gate_ok else 'MISMATCH'}")
             continue
         if not gate_ok:
             print(f"  [skip] sd{sd}: reconstruction gate failed")
             continue
 
+        def measure(pmat, yml, k):
+            sel = selected_idx(pmat, torch.tensor(yml[k]["best_center"], dtype=torch.float32), k)
+            A, B = prep(sel, Xtr, Xte)
+            out = {
+                "ridge_a1": acc_ridge(A, B, Yc, Ymu, yte, 1.0),
+                "ridge_a01": acc_ridge(A, B, Yc, Ymu, yte, 0.1),
+                "ridge_a10": acc_ridge(A, B, Yc, Ymu, yte, 10.0),
+                "logistic": acc_logistic(A, B, ytr, yte, nc),
+                "knn20": acc_knn(A, B, ytr, yte, k=20),
+                "archived": float(yml[k]["test_acc"]),
+            }
+            del A, B
+            return out
+
         for k in KS:
-            if k not in o_runs or k not in s_runs:
+            if k not in o_runs:
                 continue
-            for arm, pmat, yml in (("orig", pts, o_runs), ("shuf", pts_shuf, s_runs)):
-                sel = selected_idx(pmat, torch.tensor(yml[k]["best_center"], dtype=torch.float32), k)
-                A, B = prep(sel, Xtr, Xte)
-                rows.append({
-                    "config": name, "seed": sd, "k_frac": k, "arm": arm,
-                    "total_neurons": pts.shape[0],
-                    "ridge_a1": acc_ridge(A, B, Yc, Ymu, yte, 1.0),
-                    "ridge_a01": acc_ridge(A, B, Yc, Ymu, yte, 0.1),
-                    "ridge_a10": acc_ridge(A, B, Yc, Ymu, yte, 10.0),
-                    "logistic": acc_logistic(A, B, ytr, yte, nc),
-                    "knn20": acc_knn(A, B, ytr, yte, k=20),
-                    "archived": float(yml[k]["test_acc"]),
-                })
-                del A, B
-                print(f"  sd{sd} k={k:<5} {arm:<4} done", flush=True)
+            reps = [r for r in range(n_reps) if k in s_runs[r]]
+            if not reps:
+                continue
+            o_m = measure(pts, o_runs, k)
+            s_ms = [measure(pts_shuf[r], s_runs[r], k) for r in reps]
+            s_m = {key: float(np.mean([m[key] for m in s_ms])) for key in s_ms[0]}
+            for arm, mm in (("orig", o_m), ("shuf", s_m)):
+                rows.append({"config": name, "seed": sd, "k_frac": k, "arm": arm,
+                             "n_shuf_reps": (len(reps) if arm == "shuf" else 1),
+                             "total_neurons": pts.shape[0], **mm})
+            print(f"  sd{sd} k={k:<5} done ({len(reps)} shuf reps)", flush=True)
         del pts, pts_shuf
     del Xtr, Xte
     return rows

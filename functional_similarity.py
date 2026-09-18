@@ -57,13 +57,13 @@ CONFIGS = [
      r"dim_sweep\geo_pca\cifar10_r50_d3\results_cifar10_r50_geo_pca_sd{sd}.yaml", 10),
     ("imagenet100 geo_m", "imagenet100_r50",
      r"imagenet100_r50_fixed_geo_m\pts_fixed_seed{sd}_meanvar.pt",
-     r"imagenet100_r50_fixed_geo_m\results_imagenet100_r50_geo_m_sd{sd}.yaml", 5),
+     r"imagenet100_r50_fixed_geo_m\results_imagenet100_r50_geo_m_sd{sd}.yaml", 10),
     ("imagenet100 geo_r", "imagenet100_r50",
      r"imagenet100_r50_fixed_geo_r\pts_fixed_seed{sd}_randproj.pt",
-     r"imagenet100_r50_fixed_geo_r\results_imagenet100_r50_geo_r_sigma0.50_sd{sd}.yaml", 5),
+     r"imagenet100_r50_fixed_geo_r\results_imagenet100_r50_geo_r_sigma0.50_sd{sd}.yaml", 10),
     ("imagenet100 geo_pca", "imagenet100_r50",
      r"imagenet100_r50_pca_d3_geo_pca\pts_fixed_seed{sd}_pca.pt",
-     r"imagenet100_r50_pca_d3_geo_pca\results_imagenet100_r50_geo_pca_sd{sd}.yaml", 5),
+     r"imagenet100_r50_pca_d3_geo_pca\results_imagenet100_r50_geo_pca_sd{sd}.yaml", 10),
 ]
 
 K_FRACS = [0.05, 0.10, 0.20]
@@ -91,10 +91,17 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--n-cal", type=int, default=4000)
     ap.add_argument("--pairs", type=int, default=300000)
-    ap.add_argument("--n-perm", type=int, default=20)
+    ap.add_argument("--n-perm", type=int, default=999)
     ap.add_argument("--n-rand-sets", type=int, default=200)
     ap.add_argument("--seeds", type=int, default=None, help="cap seeds per config")
     ap.add_argument("--only", nargs="+", default=None)
+    ap.add_argument("--inputs", choices=["calib", "test"], default="calib",
+                    help="calib = the 4000-row calibration draw that also builds "
+                         "the coordinates (shared source); test = all held-out "
+                         "evaluation images, which never enter coordinate "
+                         "construction or the gate search (label-free)")
+    ap.add_argument("--out-name", default=None,
+                    help="override the CSV basename under Reports/")
     args = ap.parse_args()
 
     per_seed_rows = []
@@ -109,6 +116,13 @@ def main():
         except TypeError:
             pack = torch.load(path, map_location="cpu")
         X = pack["X"]
+        Xte = None
+        if args.inputs == "test":
+            pte = os.path.join(DATA, f"{tag}_test.pt")
+            if not os.path.exists(pte):
+                print(f"  [skip] {label}: no held-out features at {pte}")
+                continue
+            Xte = torch.load(pte, map_location="cpu")["X"]
 
         print(f"\n{'='*78}\n{label}  (seeds 0..{n_seeds-1})\n{'='*78}", flush=True)
         for sd in range(n_seeds):
@@ -117,7 +131,14 @@ def main():
             if not (os.path.exists(pts_p) and os.path.exists(yml_p)):
                 print(f"  sd{sd}: missing artifact, skip")
                 continue
-            A = calib_slice(X, args.n_cal, sd)
+            if args.inputs == "test":
+                # Held-out evaluation images: never used for coordinates or gates.
+                # Profiles (and hence S) are then identical across seeds; the
+                # seed-to-seed spread reflects coordinate construction only.
+                A = np.asarray(Xte, dtype=np.float32)
+                A = (A - A.mean(0, keepdims=True)) / (A.std(0, keepdims=True) + 1e-6)
+            else:
+                A = calib_slice(X, args.n_cal, sd)
             N, H = A.shape
             pts = torch.load(pts_p, map_location="cpu")["pts_fixed"].float().numpy()
             d = pts.shape[1]
@@ -135,11 +156,14 @@ def main():
             d_ij, s_ij = D[I, J], S[I, J]
             rho = spearman(d_ij, s_ij)
 
-            null = []
-            for _ in range(args.n_perm):
+            null = np.empty(args.n_perm)
+            for t in range(args.n_perm):
                 perm = rng.permutation(H)
-                null.append(spearman(D[np.ix_(perm, perm)][I, J], s_ij))
-            null = np.array(null)
+                # row permutation of the points: D'[i,j] = D[perm[i], perm[j]],
+                # evaluated only on the sampled pairs
+                null[t] = spearman(D[perm[I], perm[J]], s_ij)
+            p_two = (1.0 + float((np.abs(null) >= abs(rho)).sum())) / (1.0 + len(null))
+            p_one = (1.0 + float((null <= rho).sum())) / (1.0 + len(null))
 
             pmean = (imp[I] + imp[J]) / 2.0
             qs = np.quantile(pmean, [0.2, 0.4, 0.6, 0.8])
@@ -180,7 +204,10 @@ def main():
                 per_seed_rows.append({
                     "config": label, "coord_dim": d, "seed": sd, "k_frac": kf,
                     "spearman_D_S": rho, "perm_null_mean": float(null.mean()),
-                    "perm_p": (1 + int((null <= rho).sum())) / (1 + len(null)),
+                    "perm_null_sd": float(null.std(ddof=1)),
+                    "perm_p": p_two, "perm_p_one_sided": p_one,
+                    "n_perm": int(args.n_perm), "n_inputs": int(N),
+                    "n_pairs": int(len(I)), "inputs": args.inputs,
                     "within_imp_mean_rho": float(np.mean(strata)),
                     "cohesion_selected": coh,
                     "cohesion_random_mean": float(rnd.mean()),
@@ -197,9 +224,12 @@ def main():
     import pandas as pd
     df = pd.DataFrame(per_seed_rows)
     os.makedirs(REPORTS, exist_ok=True)
-    out = os.path.join(REPORTS, "functional_similarity_vs_coord_distance.csv")
+    out = os.path.join(REPORTS, args.out_name or (
+        "functional_similarity_vs_coord_distance.csv" if args.inputs == "calib"
+        else "functional_similarity_vs_coord_distance_heldout.csv"))
     df.to_csv(out, index=False)
-    print(f"\nsaved {out}  ({len(df)} per-seed rows)")
+    print(f"\nsaved {out}  ({len(df)} per-seed rows, inputs={args.inputs}, "
+          f"n_perm={args.n_perm})")
 
     # ---- aggregate: mean +/- sd across seeds ----
     print("\n=== mean +/- sd across seeds ===")

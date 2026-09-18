@@ -60,14 +60,14 @@ CONFIGS = {
     "imagenet100": ("imagenet100_r50", [
         ("geo_m",
          r"imagenet100_r50_fixed_geo_m\pts_fixed_seed{sd}_meanvar.pt",
-         [r"imagenet100_r50_fixed_geo_m\results_imagenet100_r50_geo_m_sd{sd}.yaml"], 5),
+         [r"imagenet100_r50_fixed_geo_m\results_imagenet100_r50_geo_m_sd{sd}.yaml"], 10),
         ("geo_r",
          r"imagenet100_r50_fixed_geo_r\pts_fixed_seed{sd}_randproj.pt",
          [r"imagenet100_r50_fixed_geo_r\results_imagenet100_r50_geo_r_sigma0.50_sd{sd}.yaml",
-          r"imagenet100_r50_fixed_geo_r\results_imagenet100_r50_geo_r_sd{sd}.yaml"], 5),
+          r"imagenet100_r50_fixed_geo_r\results_imagenet100_r50_geo_r_sd{sd}.yaml"], 10),
         ("geo_pca",
          r"imagenet100_r50_pca_d3_geo_pca\pts_fixed_seed{sd}_pca.pt",
-         [r"imagenet100_r50_pca_d3_geo_pca\results_imagenet100_r50_geo_pca_sd{sd}.yaml"], 5),
+         [r"imagenet100_r50_pca_d3_geo_pca\results_imagenet100_r50_geo_pca_sd{sd}.yaml"], 10),
     ]),
 }
 REFERENCE_MODES = ["magnitude", "variance", "rate", "probe_weight"]
